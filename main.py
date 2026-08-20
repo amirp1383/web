@@ -18,6 +18,9 @@ import uvicorn
 import httpx
 import logging
 
+# ماژول همگام‌سازی زنده با Cloudflare Worker
+import cf_sync
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("X4G")
 
@@ -190,6 +193,22 @@ async def require_auth(request: Request):
     return token
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
+def _cf_snapshot() -> dict:
+    """اسنپ‌شات کامل دیتابیس برای ارسال به Cloudflare Worker.
+    از قفل استفاده نمی‌کند (فقط خواندن سطحی dictها) تا هرگز بلاک نشود؛
+    dict(...) ایمن‌ترین اسنپ‌شات لحظه‌ای در پایتون است."""
+    try:
+        return {
+            "links": dict(LINKS),
+            "subs": dict(SUBS),
+            "password_hash": AUTH.get("password_hash"),
+            "saved_at": datetime.now().isoformat(),
+            "host": CONFIG.get("host"),
+            "version": "9.5",
+        }
+    except Exception:
+        return {}
+
 @app.on_event("startup")
 async def startup():
     global http_client
@@ -199,6 +218,13 @@ async def startup():
         limits=limits, timeout=timeout, follow_redirects=True,
     )
     await load_state()
+    # فعال‌سازی همگام‌سازی زنده با Cloudflare Worker
+    try:
+        import cf_sync  # noqa: F401 (اطمینان از لود شدن ماژول حتی اگر جای دیگر ایمپورت نشده باشد)
+        cf_sync.set_snapshot_provider(_cf_snapshot)
+        await cf_sync.start()
+    except Exception as e:
+        logger.warning(f"cf_sync could not start: {e}")
     await _tg_start_bot()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
     logger.info(f"X4G v9.5 started on port {CONFIG['port']}")
@@ -206,6 +232,11 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await save_state()
+    try:
+        import cf_sync
+        await cf_sync.stop()
+    except Exception:
+        pass
     await _tg_stop_bot()
     if http_client:
         await http_client.aclose()
@@ -464,6 +495,10 @@ async def create_sub(request: Request, _=Depends(require_auth)):
         }
     asyncio.create_task(save_state())
     log_activity("sub", f"گروه «{name}» ساخته شد", "ok")
+    try:
+        cf_sync.push_event("SUB_CREATED", {"sub_id": sub_id, "name": name})
+    except Exception:
+        pass
     host = get_host(request)
     return {
         "sub_id": sub_id,
@@ -516,6 +551,10 @@ async def update_sub(sub_id: str, request: Request, _=Depends(require_auth)):
         if "link_ids" in body:
             s["link_ids"] = list(body["link_ids"])
     asyncio.create_task(save_state())
+    try:
+        cf_sync.push_event("SUB_UPDATED", {"sub_id": sub_id, "changed_fields": list(body.keys())})
+    except Exception:
+        pass
     return {"ok": True}
 
 @app.delete("/api/subs/{sub_id}")
@@ -531,6 +570,10 @@ async def delete_sub(sub_id: str, _=Depends(require_auth)):
                 link["sub_id"] = None
     asyncio.create_task(save_state())
     log_activity("sub", f"گروه «{name}» حذف شد", "warn")
+    try:
+        cf_sync.push_event("SUB_DELETED", {"sub_id": sub_id, "name": name})
+    except Exception:
+        pass
     return {"ok": True, "deleted": sub_id}
 
 @app.post("/api/subs/{sub_id}/links")
@@ -628,6 +671,10 @@ async def api_change_password(request: Request, token=Depends(require_auth)):
         SESSIONS[token] = time.time() + SESSION_TTL
     await save_state()
     log_activity("auth", "رمز عبور پنل تغییر کرد", "ok")
+    try:
+        cf_sync.push_event("SETTINGS_UPDATED", {"change": "admin_password"})
+    except Exception:
+        pass
     return {"ok": True}
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
@@ -654,6 +701,20 @@ async def get_stats(_=Depends(require_auth)):
 @app.get("/api/activity")
 async def get_activity(_=Depends(require_auth)):
     return {"logs": list(activity_logs)[-150:]}
+
+# ── Cloudflare Live Sync — وضعیت و اجرای دستی ────────────────────────────────
+@app.get("/api/cf-sync/status")
+async def cf_sync_status(_=Depends(require_auth)):
+    """گزارش وضعیت ماژول همگام‌سازی زنده با Cloudflare Worker."""
+    return cf_sync.get_stats()
+
+@app.post("/api/cf-sync/push")
+async def cf_sync_push_now(_=Depends(require_auth)):
+    """اجبار به ارسال یک بکاپ کامل همین الان (Manual Push)."""
+    if not cf_sync.enabled():
+        raise HTTPException(status_code=400, detail="cf_sync غیرفعال است (CF_WORKER_URL/CF_SYNC_SECRET تنظیم نشده).")
+    cf_sync.push_event("MANUAL_FULL_BACKUP", {"triggered_by": "admin"})
+    return {"ok": True}
 
 # ── Live connections (with IP) ────────────────────────────────────────────────
 @app.get("/api/connections")
@@ -765,6 +826,17 @@ async def make_link(
                     ids.append(uid)
     asyncio.create_task(save_state())
     log_activity("link", f"کانفیگ «{LINKS[uid]['label']}» ساخته شد", "ok")
+    try:
+        cf_sync.push_event("USER_CREATED", {
+            "uuid": uid,
+            "label": LINKS[uid].get("label"),
+            "limit_bytes": LINKS[uid].get("limit_bytes"),
+            "expires_at": LINKS[uid].get("expires_at"),
+            "protocol": LINKS[uid].get("protocol"),
+            "sub_id": sub_id,
+        })
+    except Exception:
+        pass
     return uid, LINKS[uid]
 
 async def remove_link(uid: str) -> str | None:
@@ -782,6 +854,10 @@ async def remove_link(uid: str) -> str | None:
                     ids.remove(uid)
     asyncio.create_task(save_state())
     log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
+    try:
+        cf_sync.push_event("USER_DELETED", {"uuid": uid, "label": label, "sub_id": sub_id})
+    except Exception:
+        pass
     return label
 
 async def set_link_active(uid: str, active: bool) -> dict | None:
@@ -792,6 +868,12 @@ async def set_link_active(uid: str, active: bool) -> dict | None:
         label = LINKS[uid]["label"]
     log_activity("link", f"کانفیگ «{label}» {'فعال' if active else 'غیرفعال'} شد", "ok" if active else "warn")
     asyncio.create_task(save_state())
+    try:
+        cf_sync.push_event("USER_UPDATED", {
+            "uuid": uid, "label": label, "active": bool(active), "change": "active_toggle",
+        })
+    except Exception:
+        pass
     return LINKS[uid]
 
 # ── Sub-group helpers (reusable — هم API وب هم ربات تلگرام از همین‌ها استفاده می‌کنن) ──
@@ -812,6 +894,10 @@ async def create_sub_group(name: str = "گروه جدید", desc: str = "", pass
         }
     asyncio.create_task(save_state())
     log_activity("sub", f"گروه «{name}» ساخته شد", "ok")
+    try:
+        cf_sync.push_event("SUB_CREATED", {"sub_id": sub_id, "name": name})
+    except Exception:
+        pass
     return sub_id, SUBS[sub_id]
 
 async def set_link_sub(uid: str, sub_id: str | None) -> bool:
@@ -839,6 +925,12 @@ async def set_link_sub(uid: str, sub_id: str | None) -> bool:
             LINKS[uid]["sub_id"] = sub_id
     asyncio.create_task(save_state())
     log_activity("link", f"کانفیگ «{label}» {'به گروه اضافه شد' if sub_id else 'از گروه خارج شد'}", "info")
+    try:
+        cf_sync.push_event("USER_UPDATED", {
+            "uuid": uid, "label": label, "sub_id": sub_id, "change": "sub_assignment",
+        })
+    except Exception:
+        pass
     return True
 
 async def remove_sub_group(sub_id: str) -> str | None:
@@ -853,6 +945,10 @@ async def remove_sub_group(sub_id: str) -> str | None:
                 link["sub_id"] = None
     asyncio.create_task(save_state())
     log_activity("sub", f"گروه «{name}» حذف شد", "warn")
+    try:
+        cf_sync.push_event("SUB_DELETED", {"sub_id": sub_id, "name": name})
+    except Exception:
+        pass
     return name
 
 # ── Link Management ───────────────────────────────────────────────────────────
@@ -987,6 +1083,20 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
                     ids.append(uid)
 
     asyncio.create_task(save_state())
+    try:
+        _l = LINKS.get(uid, {})
+        cf_sync.push_event("USER_UPDATED", {
+            "uuid": uid,
+            "label": _l.get("label"),
+            "limit_bytes": _l.get("limit_bytes"),
+            "used_bytes": _l.get("used_bytes"),
+            "expires_at": _l.get("expires_at"),
+            "active": _l.get("active"),
+            "sub_id": _l.get("sub_id"),
+            "changed_fields": list(body.keys()),
+        })
+    except Exception:
+        pass
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
@@ -1008,6 +1118,8 @@ from relay_vless import (
     relay_tcp_to_ws,
     websocket_tunnel,
 )
+
+
 
 app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
 
