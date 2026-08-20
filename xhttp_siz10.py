@@ -32,8 +32,8 @@ from speed_limit import throttle
 
 router = APIRouter()
 
-XHTTP_BUF = 512 * 1024
-DOWNLINK_QUEUE_MAX = 512
+XHTTP_BUF = 1024 * 1024   # 1MB read buffer (قبلاً 512KB) — سرعت بالاتر با syscall کمتر
+DOWNLINK_QUEUE_MAX = 1024  # صف بزرگ‌تر برای دانلود پرسرعت (قبلاً 512)
 SESSION_IDLE_TIMEOUT = 30
 REAPER_INTERVAL = 10
 TCP_CONNECT_TIMEOUT = 10.0
