@@ -892,6 +892,17 @@ a{color:inherit;text-decoration:none}
       <div id="lsummary">—</div>
     </div>
   </div>
+  <!-- 📢 پیام ادمین (Broadcast to all subscribers) -->
+  <div class="card" style="margin-top:14px;border-right:3px solid #A78BFA">
+    <div class="card-title"><i class="ti ti-speakerphone" style="color:#A78BFA"></i> پیام ادمین به مشتری‌ها <span class="badge bg-purple" style="margin-right:8px">Broadcast</span></div>
+    <div style="color:var(--t2);font-size:12px;margin-bottom:10px">این پیام به‌عنوان یه ردیف اطلاعاتی داخل v2rayNG/Streisand/Hiddify همه‌ی مشتری‌ها ظاهر می‌شه (حداکثر ۲۰۰ کاراکتر).</div>
+    <textarea id="admin-msg-input" placeholder="مثلاً: به‌روزرسانی سرور فردا ساعت ۲ بامداد · بدون قطعی" maxlength="200" style="width:100%;min-height:60px;padding:10px 12px;border:1px solid var(--card-b);background:var(--bg2);color:var(--t1);border-radius:8px;font-family:inherit;font-size:13px;resize:vertical;outline:none"></textarea>
+    <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-sm btn-pur" onclick="saveAdminMsg()"><i class="ti ti-send"></i> ارسال به همه‌ی مشتریان</button>
+      <button class="btn btn-sm btn-o" onclick="clearAdminMsg()"><i class="ti ti-eraser"></i> پاک کردن پیام</button>
+      <span style="color:var(--t2);font-size:11px;margin-right:auto" id="admin-msg-info">—</span>
+    </div>
+  </div>
   <div class="dash-footer">
     <span class="df-text">X4G v9.5 · Railway</span>
     <a class="df-link" href="https://t.me/Farajian2004f" target="_blank"><i class="ti ti-brand-telegram"></i> t.me/Farajian2004f</a>
@@ -912,41 +923,43 @@ a{color:inherit;text-decoration:none}
       </div>
     </div>
     <div class="cp-body">
+      <div class="cp-block mb16">
+        <div class="cp-block-label"><i class="ti ti-id-badge-2"></i> شناسه کانفیگ</div>
+        <input class="cp-input-full" id="nl-label" placeholder="مثلاً: کاربر علی">
+        <div class="cp-mini-row">
+          <input class="cp-input-full" id="nl-note" placeholder="یادداشت (اختیاری)">
+        </div>
+        <!-- select گروه مخفیه چون گروه خودکار ساخته می‌شه ولی JS ازش استفاده می‌کنه -->
+        <select id="nl-sub" style="display:none"><option value="" selected>— خودکار —</option></select>
+      </div>
       <div class="cp-row">
         <div class="cp-block">
-          <div class="cp-block-label"><i class="ti ti-id-badge-2"></i> شناسه کانفیگ</div>
-          <input class="cp-input-full" id="nl-label" placeholder="مثلاً: کاربر علی">
-          <div class="cp-mini-row">
-            <input class="cp-input-full" id="nl-note" placeholder="یادداشت (اختیاری)">
+          <div class="cp-block-label"><i class="ti ti-gauge"></i> سهمیه ترافیک</div>
+          <div class="cp-quota-inputs">
+            <input class="cp-input-full" id="nl-val" type="number" min="0" step="0.1" placeholder="0 = نامحدود">
+            <select class="cp-input-full fs" id="nl-unit"><option value="GB">GB</option><option value="MB" selected>MB</option></select>
+          </div>
+          <div class="chip-row" id="quota-chips">
+            <span class="chip" onclick="setQuota(0,'GB',this)">نامحدود</span>
+            <span class="chip" onclick="setQuota(500,'MB',this)">۵۰۰ MB</span>
+            <span class="chip active" onclick="setQuota(1,'GB',this)">۱ GB</span>
+            <span class="chip" onclick="setQuota(5,'GB',this)">۵ GB</span>
+            <span class="chip" onclick="setQuota(10,'GB',this)">۱۰ GB</span>
+            <span class="chip" onclick="setQuota(50,'GB',this)">۵۰ GB</span>
           </div>
         </div>
         <div class="cp-block">
-          <div class="cp-block-label"><i class="ti ti-folders"></i> گروه ساب و انقضا</div>
-          <select class="cp-input-full fs" id="nl-sub"><option value="">— بدون گروه —</option></select>
-          <div class="cp-mini-row">
-            <input class="cp-input-full" id="nl-exp" type="number" min="0" step="1" placeholder="انقضا (روز) · 0 = نامحدود">
-          </div>
+          <div class="cp-block-label"><i class="ti ti-calendar-time"></i> زمان انقضا</div>
+          <input class="cp-input-full" id="nl-exp" type="number" min="0" step="1" placeholder="روز · 0 = نامحدود">
           <div class="chip-row" id="exp-chips">
             <span class="chip" onclick="setExpiry(0,this)">نامحدود</span>
             <span class="chip" onclick="setExpiry(7,this)">۷ روز</span>
             <span class="chip active" onclick="setExpiry(30,this)">۳۰ روز</span>
+            <span class="chip" onclick="setExpiry(60,this)">۶۰ روز</span>
             <span class="chip" onclick="setExpiry(90,this)">۹۰ روز</span>
+            <span class="chip" onclick="setExpiry(180,this)">۶ ماه</span>
+            <span class="chip" onclick="setExpiry(365,this)">۱ سال</span>
           </div>
-        </div>
-      </div>
-      <div class="cp-block mb16">
-        <div class="cp-block-label"><i class="ti ti-gauge"></i> سهمیه ترافیک</div>
-        <div class="cp-quota-inputs">
-          <input class="cp-input-full" id="nl-val" type="number" min="0" step="0.1" placeholder="0 = نامحدود">
-          <select class="cp-input-full fs" id="nl-unit"><option value="GB">GB</option><option value="MB" selected>MB</option></select>
-        </div>
-        <div class="chip-row" id="quota-chips">
-          <span class="chip" onclick="setQuota(0,'GB',this)">نامحدود</span>
-          <span class="chip" onclick="setQuota(500,'MB',this)">۵۰۰ MB</span>
-          <span class="chip active" onclick="setQuota(1,'GB',this)">۱ GB</span>
-          <span class="chip" onclick="setQuota(5,'GB',this)">۵ GB</span>
-          <span class="chip" onclick="setQuota(10,'GB',this)">۱۰ GB</span>
-          <span class="chip" onclick="setQuota(50,'GB',this)">۵۰ GB</span>
         </div>
       </div>
       <div class="cp-block mb16">
@@ -1836,7 +1849,32 @@ async function fetchDefaultVless(){
 }
 function cpText(id){navigator.clipboard.writeText(document.getElementById(id).textContent).then(()=>toast('کپی شد ✓','ok'))}
 function qrFor(id){showQR(document.getElementById(id).textContent)}
-function refreshAll(){fetchStats();fetchDefaultVless();loadLinks();if(document.getElementById('pg-subgroups').classList.contains('on'))loadSubs();if(document.getElementById('pg-subscriptions').classList.contains('on'))loadSubsPage();if(document.getElementById('pg-connections').classList.contains('on'))loadConns();if(document.getElementById('pg-logs').classList.contains('on'))loadActivity();toast('رفرش شد','ok')}
+function refreshAll(){fetchStats();fetchDefaultVless();loadLinks();loadAdminMsg();if(document.getElementById('pg-subgroups').classList.contains('on'))loadSubs();if(document.getElementById('pg-subscriptions').classList.contains('on'))loadSubsPage();if(document.getElementById('pg-connections').classList.contains('on'))loadConns();if(document.getElementById('pg-logs').classList.contains('on'))loadActivity();toast('رفرش شد','ok')}
+
+// ── 📢 Admin Message ─────────────────────────────────────
+async function loadAdminMsg(){
+  try{
+    const r=await authF('/api/admin-message'); if(!r||!r.ok) return;
+    const d=await r.json();
+    const inp=document.getElementById('admin-msg-input'); if(!inp) return;
+    inp.value=d.text||'';
+    const info=document.getElementById('admin-msg-info');
+    if(info) info.textContent = d.updated_at ? ('آخرین بروزرسانی: '+new Date(d.updated_at).toLocaleString('fa-IR')) : 'پیامی ثبت نشده';
+  }catch(e){}
+}
+async function saveAdminMsg(){
+  const inp=document.getElementById('admin-msg-input'); if(!inp) return;
+  const text=inp.value.trim();
+  try{
+    const r=await authF('/api/admin-message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+    if(r&&r.ok){ toast(text?'📢 پیام برای همه‌ی مشتری‌ها ارسال شد':'پیام پاک شد','ok'); loadAdminMsg(); }
+    else toast('خطا در ارسال پیام','err');
+  }catch(e){ toast('خطا در ارسال پیام','err'); }
+}
+async function clearAdminMsg(){
+  const inp=document.getElementById('admin-msg-input'); if(inp) inp.value='';
+  await saveAdminMsg();
+}
 async function changePw(){
   const cur=document.getElementById('cp-cur').value,nw=document.getElementById('cp-new').value,cf=document.getElementById('cp-cf').value;
   if(!cur||!nw||!cf){toast('همه فیلدها را پر کنید','err');return}
@@ -1959,7 +1997,7 @@ document.addEventListener('DOMContentLoaded',async()=>{
   initCharts();
   document.getElementById('set-host').textContent=location.host;
   document.getElementById('sub-all-url')&&(document.getElementById('sub-all-url').textContent=location.protocol+'//'+location.host+'/sub-all');
-  fetchStats();fetchDefaultVless();loadLinks();loadSubs();
+  fetchStats();fetchDefaultVless();loadLinks();loadSubs();loadAdminMsg();
   setInterval(fetchStats,4000);
   setInterval(()=>{
     if(document.getElementById('pg-links').classList.contains('on'))loadLinks();

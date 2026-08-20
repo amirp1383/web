@@ -137,6 +137,8 @@ async def load_state():
             SUBS.update(data.get("subs", {}))
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
+            if isinstance(data.get("admin_message"), dict):
+                ADMIN_MSG.update(data["admin_message"])
             logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
@@ -149,6 +151,7 @@ async def save_state():
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
                 "password_hash": AUTH["password_hash"],
+                "admin_message": dict(ADMIN_MSG),
                 "saved_at": datetime.now().isoformat(),
             }
             tmp = DATA_FILE.with_suffix(".tmp")
@@ -213,6 +216,8 @@ def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
 AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "X4GKING"))}
+# 📢 پیام ادمین که به همه‌ی مشترکین نشون داده می‌شه (به‌صورت یه کانفیگ اطلاعاتی)
+ADMIN_MSG = {"text": "", "updated_at": None}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -391,6 +396,117 @@ def vless_link_for_link(link: dict, uid: str, host: str) -> str:
         port=link.get("port"),
     )
 
+def _fake_info_config(remark: str) -> str:
+    """
+    یه کانفیگ vless «الکی» که کار نمی‌کنه ولی توی v2rayNG/Streisand به‌عنوان یه
+    ردیف در لیست ظاهر می‌شه — استفاده‌ش برای نشون دادن اطلاعات به کاربر
+    (حجم، انقضا، لوکیشن، پیام ادمین) به‌عنوان اسم آیتم.
+    آدرس 127.0.0.1 استفاده می‌شه که هیچ‌وقت وصل نشه و مصرف نکنه.
+    """
+    fake_uuid = "00000000-0000-0000-0000-000000000000"
+    params = "encryption=none&security=none&type=tcp&headerType=none"
+    return f"vless://{fake_uuid}@127.0.0.1:80?{params}#{quote(remark)}"
+
+def format_days_left(expires_at: str | None) -> str:
+    """چند روز تا انقضا مونده؟"""
+    if not expires_at:
+        return "نامحدود"
+    try:
+        exp = datetime.fromisoformat(expires_at)
+        # اگه tz-aware نیست، به تهران بازش کن
+        if exp.tzinfo is None:
+            delta = exp - datetime.now()
+        else:
+            delta = exp - datetime.now(exp.tzinfo)
+        days = int(delta.total_seconds() / 86400)
+        if days < 0:
+            return "منقضی شده"
+        if days == 0:
+            hrs = int(delta.total_seconds() / 3600)
+            return f"{hrs} ساعت"
+        return f"{days} روز"
+    except Exception:
+        return "-"
+
+def get_country_from_ip(ip: str) -> str:
+    """کشور IP کاربر رو تشخیص می‌ده. سعی می‌کنیم از هدرهای Cloudflare استفاده کنیم."""
+    # این به عنوان fallback؛ کد اصلی از هدر cf-ipcountry استفاده می‌کنه
+    return ""
+
+def build_info_configs(links: list[dict], request: Request | None = None) -> list[str]:
+    """
+    کانفیگ‌های اطلاعاتی که در بالای لیست subscription ظاهر می‌شن:
+      1. 📊 حجم مصرفی / کل حجم
+      2. ⏰ زمان انقضا (روز باقی‌مانده)
+      3. 🎯 لوکیشن اتومات (بر اساس کشور کاربر)
+      4. 📢 پیام ادمین (اگه ست شده باشه)
+
+    این کانفیگ‌ها vless الکی هستن که فقط اسم‌شون مهمه.
+    """
+    infos = []
+    if not links:
+        return infos
+
+    # 1) 📊 حجم
+    total_used = sum(int(l.get("used_bytes", 0)) for l in links)
+    limits = [int(l.get("limit_bytes", 0)) for l in links]
+    if any(lb == 0 for lb in limits):
+        vol_line = f"📊 مصرف: {fmt_bytes(total_used)} / نامحدود"
+    else:
+        total_limit = sum(limits)
+        left = max(0, total_limit - total_used)
+        pct = int((total_used / total_limit * 100)) if total_limit > 0 else 0
+        vol_line = f"📊 مانده: {fmt_bytes(left)} / {fmt_bytes(total_limit)} ({pct}%)"
+    infos.append(_fake_info_config(vol_line))
+
+    # 2) ⏰ انقضا
+    expire_ts = 0
+    for l in links:
+        exp = l.get("expires_at")
+        if not exp:
+            continue
+        try:
+            ts = int(datetime.fromisoformat(exp).timestamp())
+            if expire_ts == 0 or ts < expire_ts:
+                expire_ts = ts
+        except Exception:
+            pass
+    if expire_ts > 0:
+        # از نزدیک‌ترین انقضا
+        try:
+            nearest_exp = min(
+                (l.get("expires_at") for l in links if l.get("expires_at")),
+                default=None
+            )
+            days_str = format_days_left(nearest_exp)
+            infos.append(_fake_info_config(f"⏰ انقضا: {days_str}"))
+        except Exception:
+            pass
+    else:
+        infos.append(_fake_info_config("⏰ انقضا: نامحدود"))
+
+    # 3) 🎯 لوکیشن اتومات
+    country = ""
+    if request is not None:
+        # Cloudflare, Railway، aiogram و بقیه معمولاً این هدر رو می‌فرستن
+        country = (request.headers.get("cf-ipcountry")
+                or request.headers.get("x-country")
+                or request.headers.get("x-vercel-ip-country")
+                or "").upper()
+    if country and country != "XX":
+        infos.append(_fake_info_config(f"🌍 لوکیشن: {country} (اتومات)"))
+    else:
+        infos.append(_fake_info_config("🎯 لوکیشن: انتخاب خودکار"))
+
+    # 4) 📢 پیام ادمین
+    msg = (ADMIN_MSG.get("text") or "").strip()
+    if msg:
+        # فقط ۶۰ کاراکتر اول برای اسم کانفیگ
+        short = msg[:60]
+        infos.append(_fake_info_config(f"📢 {short}"))
+
+    return infos
+
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
     h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
@@ -523,7 +639,10 @@ async def subscription_single(uuid: str, request: Request):
         raise HTTPException(status_code=404, detail="not found or inactive")
     host = get_host(request)
     vless = vless_link_for_link(link, uuid, host)
-    content = base64.b64encode(vless.encode()).decode()
+    # 🎯 کانفیگ‌های اطلاعاتی (حجم، انقضا، لوکیشن، پیام ادمین) در بالای لیست
+    info_lines = build_info_configs([link], request)
+    all_lines = info_lines + [vless]
+    content = base64.b64encode("\n".join(all_lines).encode()).decode()
     headers = {
         "profile-title": quote(link["label"]),
         "support-url": "https://t.me/Farajian2004f",
@@ -708,7 +827,10 @@ async def sub_group_subscription(uuid_key: str, request: Request):
                 active_links.append(link)
                 lines.append(vless_link_for_link(link, lid, host))
 
-    content = base64.b64encode("\n".join(lines).encode()).decode()
+    # 🎯 کانفیگ‌های اطلاعاتی در بالای لیست
+    info_lines = build_info_configs(active_links, request)
+    all_lines = info_lines + lines
+    content = base64.b64encode("\n".join(all_lines).encode()).decode()
     return Response(
         content=content,
         media_type="text/plain",
@@ -790,6 +912,28 @@ async def get_stats(_=Depends(require_auth)):
 @app.get("/api/activity")
 async def get_activity(_=Depends(require_auth)):
     return {"logs": list(activity_logs)[-150:]}
+
+# ── 📢 Admin Message (broadcast to all subscribers via subscription) ────────
+@app.get("/api/admin-message")
+async def get_admin_message(_=Depends(require_auth)):
+    return {
+        "text": ADMIN_MSG.get("text", ""),
+        "updated_at": ADMIN_MSG.get("updated_at"),
+    }
+
+@app.post("/api/admin-message")
+async def set_admin_message(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    text = str(body.get("text", "")).strip()[:200]
+    ADMIN_MSG["text"] = text
+    ADMIN_MSG["updated_at"] = datetime.now().isoformat()
+    await save_state()
+    log_activity("system", f"پیام ادمین به‌روزرسانی شد: «{text[:40]}»", "info")
+    try:
+        cf_sync.push_event("SETTINGS_UPDATED", {"change": "admin_message", "text": text})
+    except Exception:
+        pass
+    return {"ok": True, "text": text}
 
 # ── Cloudflare Live Sync — وضعیت و اجرای دستی ────────────────────────────────
 @app.get("/api/cf-sync/status")
@@ -1369,7 +1513,10 @@ async def public_sub_page(uuid_key: str, request: Request):
                 active_links.append(link)
                 lines.append(vless_link_for_link(link, lid, host))
 
-    content = base64.b64encode("\n".join(lines).encode()).decode()
+    # 🎯 کانفیگ‌های اطلاعاتی (حجم، انقضا، لوکیشن، پیام ادمین) در بالای لیست
+    info_lines = build_info_configs(active_links, request)
+    all_lines = info_lines + lines
+    content = base64.b64encode("\n".join(all_lines).encode()).decode()
     headers = {
         "profile-title": quote(sub["name"]),
         "support-url": "https://t.me/Farajian2004f",
