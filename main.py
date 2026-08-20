@@ -71,6 +71,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── User-Agent detection for smart subscription URLs ─────────────────────────
+# لیست کلاینت‌های VPN که وقتی به یه لینک می‌رن، انتظار محتوای subscription (base64)
+# رو دارن. اگه User-Agent هیچ‌کدوم از این‌ها نبود، فرض می‌کنیم مرورگره → صفحه‌ی
+# زیبای HTML نشون داده می‌شه.
+CLIENT_UA_MARKERS = (
+    "v2ray", "clash", "singbox", "sing-box", "shadowrocket", "quantumult",
+    "surfboard", "surge", "streisand", "nekobox", "nekoray", "v2rayn",
+    "v2rayng", "hiddify", "loon", "stash", "leaf", "matsuri", "sagernet",
+    "passwall", "openclash", "meta", "mihomo", "sfa", "sfi", "sfw",
+    "husi", "exclave", "karing", "shadowlink",
+)
+
+def is_vpn_client(request: Request) -> bool:
+    """آیا درخواست از یه کلاینت VPN می‌آد (نه مرورگر)؟"""
+    ua = (request.headers.get("user-agent") or "").lower()
+    if not ua:
+        # اگه User-Agent نداره، احتمالاً curl/wget/کلاینت ساده → base64 بده
+        return True
+    return any(marker in ua for marker in CLIENT_UA_MARKERS)
+
+def build_userinfo_header(links: list[dict]) -> str:
+    """
+    ساخت هدر subscription-userinfo که تو v2rayNG/Streisand/... حجم/انقضا رو نشون می‌ده.
+    فرمت استاندارد: upload=X; download=Y; total=Z; expire=UNIX_TS
+    - upload/download: بایت مصرف‌شده
+    - total: کل حجم مجاز (0 = نامحدود ← نشون داده نمی‌شه)
+    - expire: unix timestamp انقضا (0 = بدون انقضا)
+    """
+    total_used = sum(int(l.get("used_bytes", 0)) for l in links)
+    # جمع محدودیت‌ها (اگه یکی نامحدود بود، کل رو نامحدود می‌گیریم)
+    limits = [int(l.get("limit_bytes", 0)) for l in links]
+    if any(lb == 0 for lb in limits):
+        total_limit = 0  # نامحدود
+    else:
+        total_limit = sum(limits)
+    # نزدیک‌ترین تاریخ انقضا (اگه چند کانفیگ داشتیم)
+    expire_ts = 0
+    for l in links:
+        exp = l.get("expires_at")
+        if not exp:
+            continue
+        try:
+            ts = int(datetime.fromisoformat(exp).timestamp())
+            if expire_ts == 0 or ts < expire_ts:
+                expire_ts = ts
+        except Exception:
+            pass
+    parts = [f"upload=0", f"download={total_used}"]
+    if total_limit > 0:
+        parts.append(f"total={total_limit}")
+    if expire_ts > 0:
+        parts.append(f"expire={expire_ts}")
+    return "; ".join(parts)
+
 async def load_state():
     global LINKS, AUTH, SUBS
     try:
@@ -456,8 +510,14 @@ async def subscription_single(uuid: str, request: Request):
     host = get_host(request)
     vless = vless_link_for_link(link, uuid, host)
     content = base64.b64encode(vless.encode()).decode()
-    return Response(content=content, media_type="text/plain",
-                    headers={"profile-title": quote(link["label"]), "support-url": "https://t.me/Farajian2004f"})
+    headers = {
+        "profile-title": quote(link["label"]),
+        "support-url": "https://t.me/Farajian2004f",
+        "profile-update-interval": "12",
+        # 📊 حجم و انقضا رو تو کلاینت (v2rayNG، Streisand، Hiddify، ...) نشون می‌ده
+        "subscription-userinfo": build_userinfo_header([link]),
+    }
+    return Response(content=content, media_type="text/plain", headers=headers)
 
 @app.get("/sub-all")
 async def subscription_all(request: Request, _=Depends(require_auth)):
@@ -503,8 +563,11 @@ async def create_sub(request: Request, _=Depends(require_auth)):
     return {
         "sub_id": sub_id,
         **SUBS[sub_id],
+        # 🎯 لینک یکپارچه: هم برای مرورگر (صفحه HTML) هم برای کلاینت VPN (subscription)
         "public_url": f"https://{host}/p/{uuid_key}",
-        "sub_url": f"https://{host}/sub-group/{uuid_key}",
+        "sub_url": f"https://{host}/p/{uuid_key}",
+        # نسخه‌ی legacy برای عقب‌رو-سازگاری (اگه جایی مستقیماً به subscription نیاز بود)
+        "sub_url_legacy": f"https://{host}/sub-group/{uuid_key}",
     }
 
 @app.get("/api/subs")
@@ -528,8 +591,10 @@ async def list_subs(request: Request, _=Depends(require_auth)):
             "active_count": active_count,
             "total_used_bytes": total_used,
             "total_used_fmt": fmt_bytes(total_used),
+            # 🎯 لینک یکپارچه (مرورگر → HTML، کلاینت VPN → subscription)
             "public_url": f"https://{host}/p/{s['uuid_key']}",
-            "sub_url": f"https://{host}/sub-group/{s['uuid_key']}",
+            "sub_url": f"https://{host}/p/{s['uuid_key']}",
+            "sub_url_legacy": f"https://{host}/sub-group/{s['uuid_key']}",
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"subs": result}
@@ -615,10 +680,12 @@ async def sub_group_subscription(uuid_key: str, request: Request):
     host = get_host(request)
     link_ids = sub.get("link_ids", [])
     async with LINKS_LOCK:
+        active_links = []
         lines = []
         for lid in link_ids:
             link = LINKS.get(lid)
             if link and is_link_allowed(link):
+                active_links.append(link)
                 lines.append(vless_link_for_link(link, lid, host))
 
     content = base64.b64encode("\n".join(lines).encode()).decode()
@@ -629,6 +696,8 @@ async def sub_group_subscription(uuid_key: str, request: Request):
             "profile-title": quote(sub["name"]),
             "support-url": "https://t.me/Farajian2004f",
             "profile-update-interval": "12",
+            # 📊 حجم/انقضا داخل کلاینت VPN
+            "subscription-userinfo": build_userinfo_header(active_links),
         }
     )
 
@@ -1156,15 +1225,63 @@ async def http_proxy(target_url: str, request: Request):
         error_logs.append({"error": str(exc), "url": target_url, "time": datetime.now().isoformat()})
         raise HTTPException(status_code=502, detail=f"Proxy error: {exc}")
 
-# ── Public sub page ───────────────────────────────────────────────────────────
-@app.get("/p/{uuid_key}", response_class=HTMLResponse)
+# ── Public sub page (smart: browser → HTML page, VPN client → subscription) ─
+@app.get("/p/{uuid_key}")
 async def public_sub_page(uuid_key: str, request: Request):
+    """
+    🔥 لینک یکپارچه (Unified Sub Link)
+    یک آدرس واحد برای مشتری — و بر اساس اینکه با چی بازش می‌کنه، خروجی مناسب می‌ده:
+
+      • اگه با v2rayNG/Streisand/Hiddify/... باز کنه (کلاینت VPN):
+          → محتوای subscription (base64 کانفیگ‌ها) با هدر subscription-userinfo
+             تا حجم مصرفی، کل حجم و تاریخ انقضا داخل کلاینت نمایش داده بشه.
+
+      • اگه با مرورگر (Chrome/Safari/...) باز کنه:
+          → صفحه‌ی HTML زیبا با QR کد، مشخصات، دکمه‌ی کپی و ...
+    """
     from pages import get_public_page_html
+    import base64
+
     async with SUBS_LOCK:
-        sub = next(({"sub_id": sid, **s} for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
-    if not sub:
+        sub_entry = next(((sid, s) for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
+    if not sub_entry:
+        # اگه کلاینت VPN بود، خطای متنی؛ وگرنه صفحه HTML
+        if is_vpn_client(request):
+            return Response("not found", status_code=404, media_type="text/plain")
         return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px'>گروه پیدا نشد</h2>", status_code=404)
-    return HTMLResponse(content=get_public_page_html(uuid_key))
+    sub_id, sub = sub_entry
+
+    # 🌐 مرورگر → صفحه HTML قشنگ (همون قبلی، دست‌نخورده)
+    if not is_vpn_client(request):
+        return HTMLResponse(content=get_public_page_html(uuid_key))
+
+    # 📱 کلاینت VPN → subscription content
+    # اگه گروه رمز داره، رمز باید تو query باشه (?pw=...)
+    if sub.get("password_hash"):
+        pw = request.query_params.get("pw", "")
+        if hash_password(pw) != sub["password_hash"]:
+            return Response("wrong password", status_code=403, media_type="text/plain")
+
+    host = get_host(request)
+    link_ids = sub.get("link_ids", [])
+    async with LINKS_LOCK:
+        active_links = []
+        lines = []
+        for lid in link_ids:
+            link = LINKS.get(lid)
+            if link and is_link_allowed(link):
+                active_links.append(link)
+                lines.append(vless_link_for_link(link, lid, host))
+
+    content = base64.b64encode("\n".join(lines).encode()).decode()
+    headers = {
+        "profile-title": quote(sub["name"]),
+        "support-url": "https://t.me/Farajian2004f",
+        "profile-update-interval": "12",
+        # 📊 مهم: این هدر باعث می‌شه v2rayNG/Streisand/Hiddify حجم و انقضا رو نشون بدن
+        "subscription-userinfo": build_userinfo_header(active_links),
+    }
+    return Response(content=content, media_type="text/plain", headers=headers)
 
 @app.get("/api/public/sub/{uuid_key}")
 async def public_sub_data(uuid_key: str, request: Request):
@@ -1217,7 +1334,9 @@ async def public_sub_data(uuid_key: str, request: Request):
         "locked": False,
         "name": sub["name"],
         "desc": sub.get("desc", ""),
-        "sub_url": f"https://{host}/sub-group/{uuid_key}",
+        # 🎯 لینک یکپارچه که مشتری می‌گیره
+        "sub_url": f"https://{host}/p/{uuid_key}",
+        "sub_url_legacy": f"https://{host}/sub-group/{uuid_key}",
         "active_connections": active_conns,
         "total_used_fmt": fmt_bytes(total_used),
         "links": links_out,
