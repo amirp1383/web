@@ -776,7 +776,17 @@ a{color:inherit;text-decoration:none}
           <option value="randomized">randomized</option>
         </select>
       </div>
-      <div class="fg" style="flex:1"><label>ALPN (خالی = پیش‌فرض)</label><input class="fi" id="el-alpn" placeholder="مثلاً: h2,http/1.1" style="width:100%"></div>
+      <div class="fg" style="flex:1"><label>ALPN (خالی = پیش‌فرض)</label>
+        <input class="fi" id="el-alpn" placeholder="مثلاً: h2,http/1.1" style="width:100%">
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value='h3,h2,http/1.1'">🌟 همه</button>
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value='h2,http/1.1'">h2,http/1.1</button>
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value='h2'">h2</button>
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value='h3'">h3</button>
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value='http/1.1'">http/1.1</button>
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value=''">پیش‌فرض</button>
+        </div>
+      </div>
     </div>
     <div class="form-row" style="margin-bottom:16px">
       <div class="fg" style="flex:1"><label>پورت اتصال</label><input class="fi" id="el-port" type="number" min="1" max="65535" style="width:100%"></div>
@@ -989,9 +999,11 @@ a{color:inherit;text-decoration:none}
           <div class="cp-block-label"><i class="ti ti-antenna-bars-5"></i> ALPN</div>
           <select class="cp-input-full fs" id="nl-alpn-preset" onchange="onAlpnPresetChange()">
             <option value="">پیش‌فرض پروتکل</option>
+            <option value="h3,h2,http/1.1">🌟 همه (h3,h2,http/1.1)</option>
             <option value="h2,http/1.1">h2,http/1.1</option>
             <option value="http/1.1">http/1.1</option>
             <option value="h2">h2</option>
+            <option value="h3">h3</option>
             <option value="__custom__">دستی...</option>
           </select>
           <div class="cp-mini-row">
