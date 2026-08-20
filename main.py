@@ -1244,4 +1244,19 @@ async def test_ws_redirect():
     return HTMLResponse(content="<script>location.href='/dashboard'</script>")
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1)
+    # ⚡ تنظیمات uvicorn برای کاهش پینگ و پایداری بیشتر:
+    #   - ws_ping_interval=20 → هر 20 ثانیه ping WS برای زنده نگه‌داشتن اتصال
+    #   - ws_ping_timeout=20  → اگه 20 ثانیه pong نیومد، اتصال مرده حساب شه
+    #   - timeout_keep_alive=15 → HTTP keep-alive برای XHTTP سریع‌تر
+    #   - h11_max_incomplete_event_size بزرگ‌تر برای هدرهای بزرگ v2ray
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=CONFIG["port"],
+        log_level="info",
+        workers=1,
+        ws_ping_interval=20,
+        ws_ping_timeout=20,
+        timeout_keep_alive=15,
+        h11_max_incomplete_event_size=64 * 1024,
+    )

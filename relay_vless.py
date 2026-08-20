@@ -44,15 +44,37 @@ QUOTA_BATCH_BYTES = 128 * 1024   # 128 KB
 
 
 def _tune_upstream_socket(writer: asyncio.StreamWriter):
-    """TCP_NODELAY + بافرهای بزرگ سوکت روی اتصال upstream.
-    این باعث می‌شه سرعت واقعی به CPU/سیستم‌عامل محدود نشه و از پهنای‌باند
-    شبکه‌ی سرور Railway کامل استفاده بشه."""
+    """بهینه‌سازی سوکت upstream برای بیشترین throughput و کمترین latency (پینگ).
+
+    - TCP_NODELAY: غیرفعال کردن Nagle → پکت‌های کوچیک فوری فرستاده بشن
+      (روی پینگ بازی/تماس تصویری خیلی مهمه، الگوریتم Nagle تا 40ms منتظر می‌مونه)
+    - TCP_QUICKACK: ACK ها فوری فرستاده بشن، نه delayed ACK → کاهش پینگ ~40ms
+    - SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT: اتصال زنده بمونه و مرده‌ها سریع شناسایی شن
+    - SO_SNDBUF/SO_RCVBUF: بافرهای 2MB برای throughput بالا
+    """
     sock = writer.transport.get_extra_info("socket")
     if not sock:
         return
     try:
         import socket as _s
+        # ⚡ پینگ کم: پکت‌های کوچیک فوری بفرست، منتظر جمع شدن نمون
         sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_NODELAY, 1)
+        # ⚡ پینگ کم: ACK فوری بده (فقط لینوکس)
+        if hasattr(_s, "TCP_QUICKACK"):
+            try:
+                sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_QUICKACK, 1)
+            except OSError:
+                pass
+        # 🔗 اتصال زنده بمونه، اتصال‌های مرده سریع شناسایی شن
+        sock.setsockopt(_s.SOL_SOCKET, _s.SO_KEEPALIVE, 1)
+        if hasattr(_s, "TCP_KEEPIDLE"):
+            try:
+                sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_KEEPIDLE, 30)   # بعد 30s idle probe
+                sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_KEEPINTVL, 10)  # هر 10s یه probe
+                sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_KEEPCNT, 3)     # 3 تا probe ناموفق = قطع
+            except OSError:
+                pass
+        # 🚀 throughput بالا: بافرهای 2MB
         sock.setsockopt(_s.SOL_SOCKET, _s.SO_SNDBUF, SOCK_BUF_SIZE)
         sock.setsockopt(_s.SOL_SOCKET, _s.SO_RCVBUF, SOCK_BUF_SIZE)
     except OSError:
@@ -218,11 +240,12 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         connections[conn_id]["bytes"] += len(first_chunk)
         logger.info(f"➡️  [{conn_id}] → {address}:{port}")
 
+        # timeout 5s (قبلاً 10s) → اتصال کند سریع‌تر ابرت و کاربر معطل نمونه
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(address, port),
-            timeout=10.0
+            timeout=5.0
         )
-        # TCP_NODELAY + بافرهای بزرگ سوکت (2MB) روی upstream
+        # ⚡ کاهش پینگ + throughput بالا: TCP_NODELAY + QUICKACK + Keepalive + بافر 2MB
         _tune_upstream_socket(writer)
 
         if payload:

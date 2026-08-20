@@ -36,7 +36,7 @@ XHTTP_BUF = 1024 * 1024   # 1MB read buffer (قبلاً 512KB) — سرعت با
 DOWNLINK_QUEUE_MAX = 1024  # صف بزرگ‌تر برای دانلود پرسرعت (قبلاً 512)
 SESSION_IDLE_TIMEOUT = 30
 REAPER_INTERVAL = 10
-TCP_CONNECT_TIMEOUT = 10.0
+TCP_CONNECT_TIMEOUT = 5.0   # قبلاً 10.0 — کاهش برای پاسخگویی سریع‌تر و کاهش لَتنسی
 
 # ── تنظیمات موتور تطبیقی ──────────────────────────────────────────────────────
 SOCK_BUF_SIZE = 2 * 1024 * 1024     # SO_SNDBUF / SO_RCVBUF
@@ -80,12 +80,34 @@ def _resp_headers(fp: str) -> dict:
 
 
 def _tune_socket(writer: asyncio.StreamWriter):
-    """TCP_NODELAY + بافرهای بزرگ‌تر سوکت برای کاهش سربار سیستم‌عامل روی ترافیک بالا."""
+    """بهینه‌سازی سوکت upstream: پینگ کم + throughput بالا.
+
+    - TCP_NODELAY: پکت کوچیک فوری بره (کاهش latency ~40ms در بازی/تماس)
+    - TCP_QUICKACK: ACK فوری برای کاهش پینگ (لینوکس)
+    - SO_KEEPALIVE: اتصال زنده بمونه، اتصال‌های مرده سریع شناسایی شن
+    - SO_SNDBUF/SO_RCVBUF 2MB: throughput بالا برای دانلود سنگین
+    """
     sock = writer.transport.get_extra_info("socket")
     if not sock:
         return
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # ⚡ ACK فوری (فقط لینوکس)
+        if hasattr(socket, "TCP_QUICKACK"):
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+            except OSError:
+                pass
+        # 🔗 Keepalive
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            except OSError:
+                pass
+        # 🚀 بافرها
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF_SIZE)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF_SIZE)
     except OSError:
