@@ -139,6 +139,12 @@ async def load_state():
                 AUTH["password_hash"] = data["password_hash"]
             if isinstance(data.get("admin_message"), dict):
                 ADMIN_MSG.update(data["admin_message"])
+            if isinstance(data.get("worker_proxy"), dict):
+                # host از env اگه بود اولویت داره؛ در غیر این صورت از دیسک بخون
+                stored = data["worker_proxy"]
+                if not WORKER_PROXY.get("host"):
+                    WORKER_PROXY["host"] = str(stored.get("host") or "").strip()
+                WORKER_PROXY["enabled_default"] = bool(stored.get("enabled_default", False))
             logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
@@ -152,6 +158,7 @@ async def save_state():
                 "subs": dict(SUBS),
                 "password_hash": AUTH["password_hash"],
                 "admin_message": dict(ADMIN_MSG),
+                "worker_proxy": dict(WORKER_PROXY),
                 "saved_at": datetime.now().isoformat(),
             }
             tmp = DATA_FILE.with_suffix(".tmp")
@@ -218,6 +225,12 @@ def hash_password(pw: str) -> str:
 AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "X4GKING"))}
 # 📢 پیام ادمین که به همه‌ی مشترکین نشون داده می‌شه (به‌صورت یه کانفیگ اطلاعاتی)
 ADMIN_MSG = {"text": "", "updated_at": None}
+# 🇩🇪 Cloudflare Worker Proxy — کانفیگ‌ها به‌جای IP سرور Railway، IP اروپایی
+# Cloudflare می‌گیرن. مقدار پیش‌فرض از متغیر محیطی CF_PROXY_HOST خوانده می‌شه.
+WORKER_PROXY = {
+    "host": (os.environ.get("CF_PROXY_HOST") or "").strip(),  # مثل sub-proxy.you.workers.dev
+    "enabled_default": False,  # اگر True باشه، کانفیگ جدیدی که ساخته می‌شه پیش‌فرض روشنه
+}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -385,10 +398,23 @@ def generate_vless_link(
     return f"vless://{uuid}@{host}:{port_val}?{query}#{quote(remark)}"
 
 def vless_link_for_link(link: dict, uid: str, host: str) -> str:
-    """generate_vless_link رو با تنظیمات دستی همون کانفیگ (fingerprint/alpn/port) صدا می‌زنه."""
+    """generate_vless_link رو با تنظیمات دستی همون کانفیگ (fingerprint/alpn/port) صدا می‌زنه.
+
+    🇩🇪 اگر «Cloudflare Worker Proxy» برای این کانفیگ فعال باشد و آدرس ورکر ست شده
+    باشد، به‌جای هاست Railway از هاست ورکر استفاده می‌شود تا مشتری به IP آلمانی/
+    اروپایی Cloudflare وصل بشه، پینگ کمتر، IP اصلی مخفی و در ایران بازتر.
+
+    نکته: فقط پروتکل vless-ws با Worker کار می‌کنه؛ برای XHTTP این گزینه نادیده
+    گرفته می‌شه چون Cloudflare Worker از XHTTP پشتیبانی نمی‌کنه.
+    """
     proto = link.get("protocol", DEFAULT_PROTOCOL)
+    effective_host = host
+    if link.get("use_worker") and proto == "vless-ws":
+        wh = (link.get("worker_host") or WORKER_PROXY.get("host") or "").strip()
+        if wh:
+            effective_host = wh
     return generate_vless_link(
-        uid, host,
+        uid, host if proto != "vless-ws" else effective_host,
         remark=f"X4G-{link.get('label','')}",
         protocol=proto,
         fingerprint=link.get("fingerprint"),
@@ -913,6 +939,62 @@ async def get_stats(_=Depends(require_auth)):
 async def get_activity(_=Depends(require_auth)):
     return {"logs": list(activity_logs)[-150:]}
 
+# ── 🇩🇪 Cloudflare Worker Proxy (VLESS-WS via Cloudflare) ────────────────────
+@app.get("/api/worker-proxy")
+async def get_worker_proxy(_=Depends(require_auth)):
+    """وضعیت فعلی Worker Proxy."""
+    async with LINKS_LOCK:
+        total = sum(1 for l in LINKS.values() if l.get("protocol") == "vless-ws")
+        active = sum(1 for l in LINKS.values() if l.get("use_worker") and l.get("protocol") == "vless-ws")
+    return {
+        "host": WORKER_PROXY.get("host", ""),
+        "enabled_default": bool(WORKER_PROXY.get("enabled_default", False)),
+        "eligible_links": total,   # کل کانفیگ‌های vless-ws
+        "using_worker": active,    # چند تاشون الان از worker استفاده می‌کنن
+    }
+
+@app.post("/api/worker-proxy")
+async def set_worker_proxy(request: Request, _=Depends(require_auth)):
+    """آدرس Worker و پیش‌فرض رو ست می‌کنه."""
+    body = await request.json()
+    if "host" in body:
+        # حذف http:// و https:// و / انتهایی
+        h = str(body["host"]).strip()
+        for pref in ("https://", "http://"):
+            if h.lower().startswith(pref):
+                h = h[len(pref):]
+        h = h.rstrip("/").split("/")[0]  # فقط بخش host
+        WORKER_PROXY["host"] = h[:150]
+    if "enabled_default" in body:
+        WORKER_PROXY["enabled_default"] = bool(body["enabled_default"])
+    await save_state()
+    log_activity("system", f"Worker Proxy تنظیم شد: host={WORKER_PROXY['host'] or '—'}, default={'روشن' if WORKER_PROXY['enabled_default'] else 'خاموش'}", "info")
+    try:
+        cf_sync.push_event("SETTINGS_UPDATED", {"change": "worker_proxy", **WORKER_PROXY})
+    except Exception:
+        pass
+    return {"ok": True, **WORKER_PROXY}
+
+@app.post("/api/worker-proxy/apply-all")
+async def apply_worker_to_all(request: Request, _=Depends(require_auth)):
+    """
+    عملیات دسته‌جمعی: use_worker رو روی همه‌ی کانفیگ‌های vless-ws روشن/خاموش می‌کنه.
+    Body: {"enable": true|false}
+    """
+    body = await request.json()
+    enable = bool(body.get("enable", True))
+    changed = 0
+    async with LINKS_LOCK:
+        for uid, l in LINKS.items():
+            if l.get("protocol") == "vless-ws":
+                if bool(l.get("use_worker")) != enable:
+                    l["use_worker"] = enable
+                    changed += 1
+    if changed:
+        await save_state()
+        log_activity("system", f"Worker Proxy روی {changed} کانفیگ {'فعال' if enable else 'غیرفعال'} شد", "info")
+    return {"ok": True, "changed": changed, "enabled": enable}
+
 # ── 📢 Admin Message (broadcast to all subscribers via subscription) ────────
 @app.get("/api/admin-message")
 async def get_admin_message(_=Depends(require_auth)):
@@ -1067,6 +1149,7 @@ async def make_link(
     port: int = DEFAULT_PORT,
     ip_limit: int = 0,
     speed_limit_bytes: int = 0,
+    use_worker: bool | None = None,
 ) -> tuple[str, dict]:
     if protocol not in PROTOCOLS:
         protocol = DEFAULT_PROTOCOL
@@ -1075,6 +1158,10 @@ async def make_link(
         fingerprint = DEFAULT_FINGERPRINT
     if not (MIN_PORT <= port <= MAX_PORT):
         port = DEFAULT_PORT
+    # 🇩🇪 Worker Proxy فقط برای vless-ws معنی داره؛ اگر بی‌مقدار بود از پیش‌فرض بخون
+    if use_worker is None:
+        use_worker = bool(WORKER_PROXY.get("enabled_default"))
+    use_worker = bool(use_worker) and protocol == "vless-ws"
     uid = generate_uuid()
     async with LINKS_LOCK:
         LINKS[uid] = {
@@ -1093,6 +1180,7 @@ async def make_link(
             "port": port,
             "ip_limit": max(0, ip_limit),
             "speed_limit_bytes": max(0, speed_limit_bytes),
+            "use_worker": use_worker,
         }
     if sub_id:
         async with SUBS_LOCK:
@@ -1255,6 +1343,9 @@ async def create_link(request: Request, _=Depends(require_auth)):
     su = body.get("speed_limit_unit") or "MBIT"
     speed_limit_bytes = 0 if sv <= 0 else parse_speed_to_bytes(sv, su)
 
+    # 🇩🇪 اگر بدنه صراحتاً use_worker داشت، همون؛ وگرنه از پیش‌فرض پنل
+    uw = body.get("use_worker")
+    use_worker = bool(uw) if uw is not None else None
     uid, link = await make_link(
         label=body.get("label") or "لینک جدید",
         limit_bytes=limit_bytes,
@@ -1267,6 +1358,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         port=port,
         ip_limit=ip_limit,
         speed_limit_bytes=speed_limit_bytes,
+        use_worker=use_worker,
     )
 
     host = get_host(request)
@@ -1374,7 +1466,10 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
             link["speed_limit_bytes"] = 0 if sv <= 0 else parse_speed_to_bytes(sv, su)
             from speed_limit import reset_bucket
             reset_bucket(uid)
-        if any(k in body for k in ("label", "note", "limit_value", "expires_days", "fingerprint", "alpn", "port", "ip_limit", "speed_limit_value")):
+        if "use_worker" in body:
+            # 🇩🇪 توجه: فقط برای پروتکل vless-ws معنی داره
+            link["use_worker"] = bool(body["use_worker"]) and link.get("protocol") == "vless-ws"
+        if any(k in body for k in ("label", "note", "limit_value", "expires_days", "fingerprint", "alpn", "port", "ip_limit", "speed_limit_value", "use_worker")):
             log_activity("link", f"کانفیگ «{link['label']}» ویرایش شد", "info")
         new_sub = body.get("sub_id", "UNCHANGED")
         if new_sub != "UNCHANGED":

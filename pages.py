@@ -892,6 +892,31 @@ a{color:inherit;text-decoration:none}
       <div id="lsummary">—</div>
     </div>
   </div>
+  <!-- 🇩🇪 Cloudflare Worker Proxy -->
+  <div class="card" style="margin-top:14px;border-right:3px solid #F59E0B">
+    <div class="card-title"><i class="ti ti-world-www" style="color:#F59E0B"></i> Cloudflare Worker Proxy <span class="badge bg-amber" style="margin-right:8px">🇩🇪 IP اروپایی</span></div>
+    <div style="color:var(--t2);font-size:12px;margin-bottom:10px">
+      کانفیگ‌های <b>vless-ws</b> رو از طریق Cloudflare Worker سرو کن تا مشتری IP اروپایی بگیره، پینگ کمتر شه و IP اصلی سرور مخفی بمونه.
+      فقط برای <b>vless-ws</b> کار می‌کنه (نه XHTTP).
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">
+      <div style="flex:1;min-width:240px">
+        <label style="display:block;font-size:11px;color:var(--t2);margin-bottom:4px">آدرس Worker</label>
+        <input id="wp-host" placeholder="مثلاً: sub-proxy.jjgadradan.workers.dev" style="width:100%;padding:9px 12px;border:1px solid var(--card-b);background:var(--bg2);color:var(--t1);border-radius:8px;font-family:ui-monospace,monospace;font-size:12px;outline:none">
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--t2);padding:9px 0">
+        <input type="checkbox" id="wp-default" style="width:16px;height:16px;cursor:pointer">
+        <span>کانفیگ‌های جدید پیش‌فرض روشن باشن</span>
+      </label>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center">
+      <button class="btn btn-sm btn-amber" onclick="saveWorkerProxy()"><i class="ti ti-device-floppy"></i> ذخیره تنظیمات</button>
+      <button class="btn btn-sm btn-g" onclick="applyWorkerAll(true)"><i class="ti ti-check"></i> روشن روی همه‌ی vless-ws</button>
+      <button class="btn btn-sm btn-o" onclick="applyWorkerAll(false)"><i class="ti ti-x"></i> خاموش روی همه</button>
+      <span style="color:var(--t2);font-size:11px;margin-right:auto" id="wp-status">—</span>
+    </div>
+  </div>
+
   <!-- 📢 پیام ادمین (Broadcast to all subscribers) -->
   <div class="card" style="margin-top:14px;border-right:3px solid #A78BFA">
     <div class="card-title"><i class="ti ti-speakerphone" style="color:#A78BFA"></i> پیام ادمین به مشتری‌ها <span class="badge bg-purple" style="margin-right:8px">Broadcast</span></div>
@@ -1513,6 +1538,7 @@ async function loadLinks(){
         <span class="cfg-sub-tag" title="Fingerprint"><i class="ti ti-fingerprint"></i> ${esc(l.fingerprint||'chrome')}</span>
         <span class="cfg-sub-tag" title="آی‌پی‌های متصل / محدودیت"><i class="ti ti-users"></i> ${l.connected_ips||0}${l.ip_limit?('/'+l.ip_limit):' (∞)'}</span>
         <span class="cfg-sub-tag" title="محدودیت سرعت"><i class="ti ti-gauge"></i> ${l.speed_limit_bytes?((l.speed_limit_bytes*8/1024/1024).toFixed(1)+' Mbps'):'نامحدود'}</span>
+        ${l.protocol==='vless-ws'&&l.use_worker?`<span class="cfg-sub-tag" style="background:rgba(245,158,11,0.15);color:#F59E0B" title="از Cloudflare Worker استفاده می‌کنه (IP اروپایی)">🇩🇪 Worker</span>`:''}
         ${l.sub_id&&allSubsList.find(s=>s.sub_id===l.sub_id)?`<span class="cfg-sub-tag"><i class="ti ti-folder"></i> ${esc(allSubsList.find(s=>s.sub_id===l.sub_id).name)}</span>`:''}
       </div>
       <div class="cfg-divider-v"></div>
@@ -1521,6 +1547,7 @@ async function loadLinks(){
         <button class="btn btn-sm btn-pur btn-icon" onclick="navigator.clipboard.writeText('${esc(l.sub_url)}').then(()=>toast('🎯 لینک ساب کپی شد — به مشتری بده!','ok'))" title="⭐ لینک ساب مشتری (پابلیک + حجم + انقضا)" style="box-shadow:0 0 0 2px rgba(139,92,246,0.35)"><i class="ti ti-share-3"></i></button>
         <button class="btn btn-sm btn-g btn-icon" onclick="navigator.clipboard.writeText('${esc(l.vless_link)}').then(()=>toast('لینک vless کپی شد','ok'))" title="کپی لینک vless مستقیم"><i class="ti ti-copy"></i></button>
         <button class="btn btn-sm btn-g btn-icon" onclick="showQR('${esc(l.sub_url)}')" title="QR لینک ساب مشتری"><i class="ti ti-qrcode"></i></button>
+        ${l.protocol==='vless-ws'?`<button class="btn btn-sm ${l.use_worker?'btn-amber':'btn-g'} btn-icon" onclick="toggleWorker('${l.uuid}',${!l.use_worker})" title="${l.use_worker?'🇩🇪 از طریق Worker (کلیک: خاموش)':'🏢 مستقیم از Railway (کلیک: روشن Worker)'}">🇩🇪</button>`:''}
         <button class="btn btn-sm btn-amber btn-icon" onclick="openEditLink('${l.uuid}')" title="ویرایش"><i class="ti ti-edit"></i></button>
         <button class="btn btn-sm btn-g btn-icon" onclick="resetUsage('${l.uuid}')" title="ریست مصرف"><i class="ti ti-rotate"></i></button>
         <button class="btn btn-sm btn-d btn-icon" onclick="deleteLink('${l.uuid}')" title="حذف"><i class="ti ti-trash"></i></button>
@@ -1849,7 +1876,46 @@ async function fetchDefaultVless(){
 }
 function cpText(id){navigator.clipboard.writeText(document.getElementById(id).textContent).then(()=>toast('کپی شد ✓','ok'))}
 function qrFor(id){showQR(document.getElementById(id).textContent)}
-function refreshAll(){fetchStats();fetchDefaultVless();loadLinks();loadAdminMsg();if(document.getElementById('pg-subgroups').classList.contains('on'))loadSubs();if(document.getElementById('pg-subscriptions').classList.contains('on'))loadSubsPage();if(document.getElementById('pg-connections').classList.contains('on'))loadConns();if(document.getElementById('pg-logs').classList.contains('on'))loadActivity();toast('رفرش شد','ok')}
+function refreshAll(){fetchStats();fetchDefaultVless();loadLinks();loadAdminMsg();loadWorkerProxy();if(document.getElementById('pg-subgroups').classList.contains('on'))loadSubs();if(document.getElementById('pg-subscriptions').classList.contains('on'))loadSubsPage();if(document.getElementById('pg-connections').classList.contains('on'))loadConns();if(document.getElementById('pg-logs').classList.contains('on'))loadActivity();toast('رفرش شد','ok')}
+
+// ── سوییچ Worker برای یک کانفیگ ───────────────────────────
+async function toggleWorker(uid, enable){
+  try{
+    const r=await authF('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({use_worker:enable})});
+    if(r&&r.ok){ toast(enable?'🇩🇪 Worker روشن شد':'🏢 Worker خاموش شد','ok'); loadLinks(); loadWorkerProxy(); }
+    else toast('خطا','err');
+  }catch(e){ toast('خطا','err'); }
+}
+
+// ── 🇩🇪 Cloudflare Worker Proxy ───────────────────────────
+async function loadWorkerProxy(){
+  try{
+    const r=await authF('/api/worker-proxy'); if(!r||!r.ok) return;
+    const d=await r.json();
+    const hi=document.getElementById('wp-host'); if(hi) hi.value=d.host||'';
+    const di=document.getElementById('wp-default'); if(di) di.checked=!!d.enabled_default;
+    const st=document.getElementById('wp-status');
+    if(st) st.textContent = `کانفیگ‌های vless-ws: ${d.eligible_links||0} · فعال روی worker: ${d.using_worker||0}`;
+  }catch(e){}
+}
+async function saveWorkerProxy(){
+  const host=document.getElementById('wp-host').value.trim();
+  const enabled_default=document.getElementById('wp-default').checked;
+  try{
+    const r=await authF('/api/worker-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host,enabled_default})});
+    if(r&&r.ok){ toast('✅ تنظیمات Worker ذخیره شد','ok'); loadWorkerProxy(); loadLinks(); }
+    else toast('خطا','err');
+  }catch(e){ toast('خطا','err'); }
+}
+async function applyWorkerAll(enable){
+  if(!confirm(enable ? '🇩🇪 آیا Worker Proxy رو روی همه‌ی کانفیگ‌های vless-ws فعال کنم؟' : '❌ آیا Worker Proxy رو از همه‌ی کانفیگ‌ها خاموش کنم؟')) return;
+  try{
+    const r=await authF('/api/worker-proxy/apply-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enable})});
+    const d=await r.json();
+    toast(`✅ ${d.changed} کانفیگ ${enable?'روشن':'خاموش'} شد`,'ok');
+    loadWorkerProxy(); loadLinks();
+  }catch(e){ toast('خطا','err'); }
+}
 
 // ── 📢 Admin Message ─────────────────────────────────────
 async function loadAdminMsg(){
@@ -1997,7 +2063,7 @@ document.addEventListener('DOMContentLoaded',async()=>{
   initCharts();
   document.getElementById('set-host').textContent=location.host;
   document.getElementById('sub-all-url')&&(document.getElementById('sub-all-url').textContent=location.protocol+'//'+location.host+'/sub-all');
-  fetchStats();fetchDefaultVless();loadLinks();loadSubs();loadAdminMsg();
+  fetchStats();fetchDefaultVless();loadLinks();loadSubs();loadAdminMsg();loadWorkerProxy();
   setInterval(fetchStats,4000);
   setInterval(()=>{
     if(document.getElementById('pg-links').classList.contains('on'))loadLinks();
