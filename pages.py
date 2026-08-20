@@ -824,7 +824,6 @@ a{color:inherit;text-decoration:none}
     <div class="nav-sec">پنل</div>
     <div class="nav-it on" data-pg="overview"><i class="ti ti-layout-dashboard"></i> داشبورد</div>
     <div class="nav-it" data-pg="links"><i class="ti ti-link-plus"></i> کانفیگ‌ها <span class="nav-badge" id="links-nb">0</span></div>
-    <div class="nav-it" data-pg="subgroups"><i class="ti ti-folders"></i> گروه‌های ساب <span class="nav-badge" id="subs-nb">0</span></div>
     <div class="nav-it" data-pg="subscriptions"><i class="ti ti-rss"></i> سابسکریپشن</div>
     <div class="nav-it" data-pg="traffic"><i class="ti ti-chart-area"></i> ترافیک</div>
     <div class="nav-it" data-pg="connections"><i class="ti ti-plug-connected"></i> اتصالات <span class="nav-badge" id="conns-nb">0</span></div>
@@ -868,7 +867,6 @@ a{color:inherit;text-decoration:none}
       <button class="btn btn-p" onclick="cpText('vless-main')"><i class="ti ti-copy"></i> کپی</button>
       <button class="btn btn-g" onclick="qrFor('vless-main')"><i class="ti ti-qrcode"></i> QR</button>
       <button class="btn btn-o" onclick="navTo('links')"><i class="ti ti-link-plus"></i> کانفیگ محدود</button>
-      <button class="btn btn-pur" onclick="navTo('subgroups')"><i class="ti ti-folders"></i> گروه‌های ساب</button>
     </div>
   </div>
   <div class="g3">
@@ -1507,9 +1505,9 @@ async function loadLinks(){
       <div class="cfg-divider-v"></div>
       <div class="cfg-actions">
         <button class="tog${allowed?' on':''}" onclick="toggleActive('${l.uuid}',${!l.active})" title="فعال/غیرفعال"></button>
-        <button class="btn btn-sm btn-g btn-icon" onclick="navigator.clipboard.writeText('${esc(l.vless_link)}').then(()=>toast('لینک کپی شد','ok'))" title="کپی لینک"><i class="ti ti-copy"></i></button>
-        <button class="btn btn-sm btn-g btn-icon" onclick="navigator.clipboard.writeText('${esc(l.sub_url)}').then(()=>toast('Sub کپی شد','ok'))" title="Sub URL"><i class="ti ti-rss"></i></button>
-        <button class="btn btn-sm btn-g btn-icon" onclick="showQR('${esc(l.vless_link)}')" title="QR"><i class="ti ti-qrcode"></i></button>
+        <button class="btn btn-sm btn-pur btn-icon" onclick="navigator.clipboard.writeText('${esc(l.sub_url)}').then(()=>toast('🎯 لینک ساب کپی شد — به مشتری بده!','ok'))" title="⭐ لینک ساب مشتری (پابلیک + حجم + انقضا)" style="box-shadow:0 0 0 2px rgba(139,92,246,0.35)"><i class="ti ti-share-3"></i></button>
+        <button class="btn btn-sm btn-g btn-icon" onclick="navigator.clipboard.writeText('${esc(l.vless_link)}').then(()=>toast('لینک vless کپی شد','ok'))" title="کپی لینک vless مستقیم"><i class="ti ti-copy"></i></button>
+        <button class="btn btn-sm btn-g btn-icon" onclick="showQR('${esc(l.sub_url)}')" title="QR لینک ساب مشتری"><i class="ti ti-qrcode"></i></button>
         <button class="btn btn-sm btn-amber btn-icon" onclick="openEditLink('${l.uuid}')" title="ویرایش"><i class="ti ti-edit"></i></button>
         <button class="btn btn-sm btn-g btn-icon" onclick="resetUsage('${l.uuid}')" title="ریست مصرف"><i class="ti ti-rotate"></i></button>
         <button class="btn btn-sm btn-d btn-icon" onclick="deleteLink('${l.uuid}')" title="حذف"><i class="ti ti-trash"></i></button>
@@ -1602,8 +1600,8 @@ async function loadSubs(){
     const r=await authF('/api/subs'),d=await r.json();
     const subs=d.subs||[];
     allSubsRaw=subs;
-    document.getElementById('subs-nb').textContent=subs.length;
-    document.getElementById('subs-pg-cnt').textContent=toFa(subs.length)+' گروه';
+    const _nb=document.getElementById('subs-nb'); if(_nb) _nb.textContent=subs.length;
+    const _pc=document.getElementById('subs-pg-cnt'); if(_pc) _pc.textContent=toFa(subs.length)+' گروه';
     renderSubsGrid(subs);
   }catch(e){console.error(e)}
 }

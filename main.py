@@ -272,6 +272,20 @@ async def startup():
         limits=limits, timeout=timeout, follow_redirects=True,
     )
     await load_state()
+    # 🎯 برای هر کانفیگ قدیمی که هنوز گروه ساب نداره، گروه خودکار بساز
+    try:
+        async with LINKS_LOCK:
+            snap = list(LINKS.items())
+        migrated = 0
+        for uid, link in snap:
+            if not link.get("sub_id"):
+                await _ensure_auto_sub_for_link(uid, link.get("label", "کانفیگ"))
+                migrated += 1
+        if migrated:
+            logger.info(f"🔗 auto-created sub groups for {migrated} legacy links")
+            await save_state()
+    except Exception as e:
+        logger.warning(f"auto-sub migration failed: {e}")
     # فعال‌سازی همگام‌سازی زنده با Cloudflare Worker
     try:
         import cf_sync  # noqa: F401 (اطمینان از لود شدن ماژول حتی اگر جای دیگر ایمپورت نشده باشد)
@@ -572,6 +586,9 @@ async def create_sub(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/subs")
 async def list_subs(request: Request, _=Depends(require_auth)):
+    """گروه‌های ساب که کاربر مستقیم ساخته — گروه‌های خودکارِ تک‌کانفیگ مخفی می‌شن.
+    (چون هر کانفیگ لینک ساب پابلیک خودش رو در کارت کانفیگ داره.)"""
+    include_auto = request.query_params.get("include_auto") == "1"
     host = get_host(request)
     async with SUBS_LOCK:
         snap_subs = dict(SUBS)
@@ -579,6 +596,9 @@ async def list_subs(request: Request, _=Depends(require_auth)):
         snap_links = dict(LINKS)
     result = []
     for sid, s in snap_subs.items():
+        # فقط گروه‌های دستی (نه گروه‌های خودکار تک‌کانفیگ) نمایش داده بشن
+        if s.get("auto_created") and not include_auto:
+            continue
         link_ids = s.get("link_ids", [])
         active_count = sum(1 for lid in link_ids if is_link_allowed(snap_links.get(lid)))
         total_used = sum(snap_links[lid].get("used_bytes", 0) for lid in link_ids if lid in snap_links)
@@ -848,6 +868,49 @@ async def get_connections(_=Depends(require_auth)):
     }
 
 # ── Shared link create/delete helpers (استفاده مشترک API و ربات تلگرام) ───────
+async def _ensure_auto_sub_for_link(uid: str, label: str) -> str | None:
+    """
+    برای هر کانفیگ به‌طور خودکار یه گروه ساب می‌سازه (اگه نداشته باشه) که لینک
+    یکپارچه‌ی `/p/{uuid_key}` براش وجود داشته باشه.
+
+    این باعث می‌شه ادمین بدون نیاز به دست‌کاری «گروه‌های ساب»، مستقیم از کارت
+    کانفیگ لینک پابلیک/ساب رو کپی کنه و به مشتری بده. مشتری در کلاینت v2ray
+    حجم و انقضا رو خودکار می‌بینه.
+
+    اگه کانفیگ قبلاً به یه گروهی متصل بود، همون رو نگه می‌داره.
+    """
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if link is None:
+            return None
+        existing_sub = link.get("sub_id")
+    if existing_sub:
+        async with SUBS_LOCK:
+            if existing_sub in SUBS:
+                return existing_sub
+        # sub_id قدیمی معتبر نیست → پاکش می‌کنیم و از نو می‌سازیم
+        async with LINKS_LOCK:
+            if uid in LINKS:
+                LINKS[uid]["sub_id"] = None
+
+    # ساخت گروه خودکار
+    sub_id = generate_uuid()
+    uuid_key = secrets.token_urlsafe(16)
+    async with SUBS_LOCK:
+        SUBS[sub_id] = {
+            "name": (label or "کانفیگ")[:60],
+            "desc": "",
+            "password_hash": None,
+            "uuid_key": uuid_key,
+            "created_at": datetime.now().isoformat(),
+            "link_ids": [uid],
+            "auto_created": True,   # نشانه‌ی گروه خودکار — در UI مخفی می‌مونه
+        }
+    async with LINKS_LOCK:
+        if uid in LINKS:
+            LINKS[uid]["sub_id"] = sub_id
+    return sub_id
+
 async def make_link(
     label: str = "لینک جدید",
     limit_bytes: int = 0,
@@ -893,6 +956,9 @@ async def make_link(
                 ids = SUBS[sub_id].setdefault("link_ids", [])
                 if uid not in ids:
                     ids.append(uid)
+    else:
+        # 🎯 گروه ساب خودکار برای این کانفیگ (تا لینک یکپارچه /p/... داشته باشه)
+        sub_id = await _ensure_auto_sub_for_link(uid, LINKS[uid]["label"])
     asyncio.create_task(save_state())
     log_activity("link", f"کانفیگ «{LINKS[uid]['label']}» ساخته شد", "ok")
     try:
@@ -921,6 +987,9 @@ async def remove_link(uid: str) -> str | None:
                 ids = SUBS[sub_id].get("link_ids", [])
                 if uid in ids:
                     ids.remove(uid)
+                # اگه گروه خودکار بود و کانفیگی توش نمونده، خودش حذف بشه
+                if SUBS[sub_id].get("auto_created") and not SUBS[sub_id].get("link_ids"):
+                    del SUBS[sub_id]
     asyncio.create_task(save_state())
     log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
     try:
@@ -1057,12 +1126,20 @@ async def create_link(request: Request, _=Depends(require_auth)):
     )
 
     host = get_host(request)
+    # 🎯 لینک یکپارچه (پابلیک + ساب): از گروه ساب خودکار این کانفیگ
+    smart_url = f"https://{host}/sub/{uid}"
+    sid = link.get("sub_id")
+    if sid:
+        async with SUBS_LOCK:
+            if sid in SUBS and SUBS[sid].get("uuid_key"):
+                smart_url = f"https://{host}/p/{SUBS[sid]['uuid_key']}"
     return {
         "uuid": uid,
         **link,
         "expired": False,
         "vless_link": vless_link_for_link(link, uid, host),
-        "sub_url": f"https://{host}/sub/{uid}",
+        "sub_url": smart_url,               # ⭐ لینک یکپارچه (این رو مشتری می‌بره)
+        "single_sub_url": f"https://{host}/sub/{uid}",  # لینک ساده تک‌کانفیگ (بک‌آپ)
     }
 
 @app.get("/api/links")
@@ -1070,16 +1147,24 @@ async def list_links(request: Request, _=Depends(require_auth)):
     host = get_host(request)
     async with LINKS_LOCK:
         snap = dict(LINKS)
+    async with SUBS_LOCK:
+        subs_snap = dict(SUBS)
     result = []
     for uid, d in snap.items():
         proto = d.get("protocol", DEFAULT_PROTOCOL)
+        # 🎯 لینک یکپارچه (پابلیک + ساب) از گروه ساب خودکار
+        smart_url = f"https://{host}/sub/{uid}"
+        sid = d.get("sub_id")
+        if sid and sid in subs_snap and subs_snap[sid].get("uuid_key"):
+            smart_url = f"https://{host}/p/{subs_snap[sid]['uuid_key']}"
         result.append({
             "uuid": uid,
             **d,
             "protocol": proto,
             "expired": is_link_expired(d),
             "vless_link": vless_link_for_link(d, uid, host),
-            "sub_url": f"https://{host}/sub/{uid}",
+            "sub_url": smart_url,                             # ⭐ لینک یکپارچه
+            "single_sub_url": f"https://{host}/sub/{uid}",    # لینک ساده تک
             "connected_ips": len(unique_ips_for_uuid(uid)),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
@@ -1099,6 +1184,17 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
             log_activity("link", f"کانفیگ «{label}» {'فعال' if link['active'] else 'غیرفعال'} شد", "ok" if link["active"] else "warn")
         if "label" in body:
             link["label"] = str(body["label"])[:60]
+            # اگه گروه ساب خودکار داره، اسم گروه هم آپدیت بشه
+            _sid = link.get("sub_id")
+            if _sid:
+                # (بدون async lock چون همین لحظه توی SUBS_LOCK جدا می‌ره؛
+                #  ولی از اونجایی که مقدار ساده‌ای رو ست می‌کنیم و خطرناک نیست
+                #  از تلاش ساده استفاده می‌کنیم)
+                try:
+                    if _sid in SUBS and SUBS[_sid].get("auto_created"):
+                        SUBS[_sid]["name"] = link["label"]
+                except Exception:
+                    pass
         if "note" in body:
             link["note"] = str(body["note"])[:200]
         if "reset_usage" in body and body["reset_usage"]:
