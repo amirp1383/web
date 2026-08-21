@@ -28,7 +28,57 @@ from speed_limit import throttle
 # VLESS Relay — بهینه‌شده برای حداکثر throughput
 # ══════════════════════════════════════════════════════════════════════════════
 
-RELAY_BUF = 256 * 1024   # 256 KB buffer
+# بافر relay از 256KB به 1MB افزایش یافت.
+# با اینترنت پرسرعت (100Mbps+) و کاربران هم‌زمان زیاد، بافر بزرگ‌تر یعنی:
+#   - syscall های read/write کمتر
+#   - کاهش overhead جابجایی داده بین کرنل و userspace
+#   - throughput پایدارتر روی دانلود‌های سنگین
+RELAY_BUF = 1024 * 1024   # 1 MB buffer (قبلاً 256 KB)
+
+# تنظیمات بهینه‌سازی سوکت‌های TCP هدف (upstream)
+SOCK_BUF_SIZE = 2 * 1024 * 1024   # SO_SNDBUF / SO_RCVBUF = 2MB
+
+# چک کوتا/محدودیت — به‌جای هر پیام، هر N بایت یک بار قفل رو می‌گیریم
+# (باعث می‌شه lock contention کم بشه، مخصوصاً روی دانلود سنگین)
+QUOTA_BATCH_BYTES = 128 * 1024   # 128 KB
+
+
+def _tune_upstream_socket(writer: asyncio.StreamWriter):
+    """بهینه‌سازی سوکت upstream برای بیشترین throughput و کمترین latency (پینگ).
+
+    - TCP_NODELAY: غیرفعال کردن Nagle → پکت‌های کوچیک فوری فرستاده بشن
+      (روی پینگ بازی/تماس تصویری خیلی مهمه، الگوریتم Nagle تا 40ms منتظر می‌مونه)
+    - TCP_QUICKACK: ACK ها فوری فرستاده بشن، نه delayed ACK → کاهش پینگ ~40ms
+    - SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT: اتصال زنده بمونه و مرده‌ها سریع شناسایی شن
+    - SO_SNDBUF/SO_RCVBUF: بافرهای 2MB برای throughput بالا
+    """
+    sock = writer.transport.get_extra_info("socket")
+    if not sock:
+        return
+    try:
+        import socket as _s
+        # ⚡ پینگ کم: پکت‌های کوچیک فوری بفرست، منتظر جمع شدن نمون
+        sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_NODELAY, 1)
+        # ⚡ پینگ کم: ACK فوری بده (فقط لینوکس)
+        if hasattr(_s, "TCP_QUICKACK"):
+            try:
+                sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_QUICKACK, 1)
+            except OSError:
+                pass
+        # 🔗 اتصال زنده بمونه، اتصال‌های مرده سریع شناسایی شن
+        sock.setsockopt(_s.SOL_SOCKET, _s.SO_KEEPALIVE, 1)
+        if hasattr(_s, "TCP_KEEPIDLE"):
+            try:
+                sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_KEEPIDLE, 30)   # بعد 30s idle probe
+                sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_KEEPINTVL, 10)  # هر 10s یه probe
+                sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_KEEPCNT, 3)     # 3 تا probe ناموفق = قطع
+            except OSError:
+                pass
+        # 🚀 throughput بالا: بافرهای 2MB
+        sock.setsockopt(_s.SOL_SOCKET, _s.SO_SNDBUF, SOCK_BUF_SIZE)
+        sock.setsockopt(_s.SOL_SOCKET, _s.SO_RCVBUF, SOCK_BUF_SIZE)
+    except OSError:
+        pass
 
 def _ws_client_ip(ws: WebSocket) -> str:
     fwd = ws.headers.get("x-forwarded-for")
@@ -72,6 +122,26 @@ async def check_and_use(uid: str, n: int) -> bool:
         hourly_traffic[now_ir().strftime("%H:00")] += n
     return True
 
+# ── Batched quota gate ────────────────────────────────────────────────────────
+# به‌جای اینکه بابت هر پیام یک بار قفل بگیریم و آمار رو آپدیت کنیم،
+# بایت‌ها رو تجمیع می‌کنیم و هر QUOTA_BATCH_BYTES یک بار async قفل رو می‌گیریم.
+# این باعث می‌شه throughput به‌شدت بره بالا (کمتر lock, کمتر ctx switch).
+_batch_buckets: dict = {}   # {conn_id: pending_bytes}
+
+async def _batched_check_and_use(uid: str, n: int, conn_id: str) -> bool:
+    pending = _batch_buckets.get(conn_id, 0) + n
+    if pending < QUOTA_BATCH_BYTES:
+        _batch_buckets[conn_id] = pending
+        return True
+    _batch_buckets[conn_id] = 0
+    return await check_and_use(uid, pending)
+
+def _flush_batch(conn_id: str, uid: str):
+    """در پایان اتصال، بایت‌های باقی‌مانده رو یک‌بار ثبت می‌کنه."""
+    pending = _batch_buckets.pop(conn_id, 0)
+    if pending > 0:
+        asyncio.create_task(check_and_use(uid, pending))
+
 async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: str, uid: str):
     try:
         while True:
@@ -81,18 +151,21 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
             data = msg.get("bytes") or (msg.get("text") or "").encode()
             if not data:
                 continue
-            if not await check_and_use(uid, len(data)):
+            # چک کوتا به‌صورت batched انجام می‌شه (کمتر قفل → سریع‌تر)
+            if not await _batched_check_and_use(uid, len(data), conn_id):
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             await throttle(uid, len(data))
             stats["total_requests"] += 1
             connections[conn_id]["bytes"] += len(data)
             writer.write(data)
+            # فقط زمانی drain کن که واقعاً backpressure باشه (بافر بزرگ‌تره)
             if writer.transport.get_write_buffer_size() > RELAY_BUF:
                 await writer.drain()
     except (WebSocketDisconnect, Exception):
         pass
     finally:
+        _flush_batch(conn_id, uid)
         try:
             writer.write_eof()
         except Exception:
@@ -105,7 +178,7 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
             data = await reader.read(RELAY_BUF)
             if not data:
                 break
-            if not await check_and_use(uid, len(data)):
+            if not await _batched_check_and_use(uid, len(data), conn_id):
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             await throttle(uid, len(data))
@@ -115,6 +188,8 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
             await ws.send_bytes(payload)
     except Exception:
         pass
+    finally:
+        _flush_batch(conn_id, uid)
 
 async def websocket_tunnel(ws: WebSocket, uuid: str):
     await ws.accept()
@@ -165,14 +240,13 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         connections[conn_id]["bytes"] += len(first_chunk)
         logger.info(f"➡️  [{conn_id}] → {address}:{port}")
 
+        # timeout 5s (قبلاً 10s) → اتصال کند سریع‌تر ابرت و کاربر معطل نمونه
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(address, port),
-            timeout=10.0
+            timeout=5.0
         )
-        sock = writer.transport.get_extra_info('socket')
-        if sock:
-            import socket
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # ⚡ کاهش پینگ + throughput بالا: TCP_NODELAY + QUICKACK + Keepalive + بافر 2MB
+        _tune_upstream_socket(writer)
 
         if payload:
             writer.write(payload)

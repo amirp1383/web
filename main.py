@@ -18,6 +18,9 @@ import uvicorn
 import httpx
 import logging
 
+# ماژول همگام‌سازی زنده با Cloudflare Worker
+import cf_sync
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("X4G")
 
@@ -68,6 +71,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── User-Agent detection for smart subscription URLs ─────────────────────────
+# لیست کلاینت‌های VPN که وقتی به یه لینک می‌رن، انتظار محتوای subscription (base64)
+# رو دارن. اگه User-Agent هیچ‌کدوم از این‌ها نبود، فرض می‌کنیم مرورگره → صفحه‌ی
+# زیبای HTML نشون داده می‌شه.
+CLIENT_UA_MARKERS = (
+    "v2ray", "clash", "singbox", "sing-box", "shadowrocket", "quantumult",
+    "surfboard", "surge", "streisand", "nekobox", "nekoray", "v2rayn",
+    "v2rayng", "hiddify", "loon", "stash", "leaf", "matsuri", "sagernet",
+    "passwall", "openclash", "meta", "mihomo", "sfa", "sfi", "sfw",
+    "husi", "exclave", "karing", "shadowlink",
+)
+
+def is_vpn_client(request: Request) -> bool:
+    """آیا درخواست از یه کلاینت VPN می‌آد (نه مرورگر)؟"""
+    ua = (request.headers.get("user-agent") or "").lower()
+    if not ua:
+        # اگه User-Agent نداره، احتمالاً curl/wget/کلاینت ساده → base64 بده
+        return True
+    return any(marker in ua for marker in CLIENT_UA_MARKERS)
+
+def build_userinfo_header(links: list[dict]) -> str:
+    """
+    ساخت هدر subscription-userinfo که تو v2rayNG/Streisand/... حجم/انقضا رو نشون می‌ده.
+    فرمت استاندارد: upload=X; download=Y; total=Z; expire=UNIX_TS
+    - upload/download: بایت مصرف‌شده
+    - total: کل حجم مجاز (0 = نامحدود ← نشون داده نمی‌شه)
+    - expire: unix timestamp انقضا (0 = بدون انقضا)
+    """
+    total_used = sum(int(l.get("used_bytes", 0)) for l in links)
+    # جمع محدودیت‌ها (اگه یکی نامحدود بود، کل رو نامحدود می‌گیریم)
+    limits = [int(l.get("limit_bytes", 0)) for l in links]
+    if any(lb == 0 for lb in limits):
+        total_limit = 0  # نامحدود
+    else:
+        total_limit = sum(limits)
+    # نزدیک‌ترین تاریخ انقضا (اگه چند کانفیگ داشتیم)
+    expire_ts = 0
+    for l in links:
+        exp = l.get("expires_at")
+        if not exp:
+            continue
+        try:
+            ts = int(datetime.fromisoformat(exp).timestamp())
+            if expire_ts == 0 or ts < expire_ts:
+                expire_ts = ts
+        except Exception:
+            pass
+    parts = [f"upload=0", f"download={total_used}"]
+    if total_limit > 0:
+        parts.append(f"total={total_limit}")
+    if expire_ts > 0:
+        parts.append(f"expire={expire_ts}")
+    return "; ".join(parts)
+
 async def load_state():
     global LINKS, AUTH, SUBS
     try:
@@ -80,6 +137,14 @@ async def load_state():
             SUBS.update(data.get("subs", {}))
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
+            if isinstance(data.get("admin_message"), dict):
+                ADMIN_MSG.update(data["admin_message"])
+            if isinstance(data.get("worker_proxy"), dict):
+                # host از env اگه بود اولویت داره؛ در غیر این صورت از دیسک بخون
+                stored = data["worker_proxy"]
+                if not WORKER_PROXY.get("host"):
+                    WORKER_PROXY["host"] = str(stored.get("host") or "").strip()
+                WORKER_PROXY["enabled_default"] = bool(stored.get("enabled_default", False))
             logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
@@ -92,6 +157,8 @@ async def save_state():
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
                 "password_hash": AUTH["password_hash"],
+                "admin_message": dict(ADMIN_MSG),
+                "worker_proxy": dict(WORKER_PROXY),
                 "saved_at": datetime.now().isoformat(),
             }
             tmp = DATA_FILE.with_suffix(".tmp")
@@ -156,6 +223,14 @@ def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
 AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "X4GKING"))}
+# 📢 پیام ادمین که به همه‌ی مشترکین نشون داده می‌شه (به‌صورت یه کانفیگ اطلاعاتی)
+ADMIN_MSG = {"text": "", "updated_at": None}
+# 🇩🇪 Cloudflare Worker Proxy — کانفیگ‌ها به‌جای IP سرور Railway، IP اروپایی
+# Cloudflare می‌گیرن. مقدار پیش‌فرض از متغیر محیطی CF_PROXY_HOST خوانده می‌شه.
+WORKER_PROXY = {
+    "host": (os.environ.get("CF_PROXY_HOST") or "").strip(),  # مثل sub-proxy.you.workers.dev
+    "enabled_default": False,  # اگر True باشه، کانفیگ جدیدی که ساخته می‌شه پیش‌فرض روشنه
+}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -190,6 +265,22 @@ async def require_auth(request: Request):
     return token
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
+def _cf_snapshot() -> dict:
+    """اسنپ‌شات کامل دیتابیس برای ارسال به Cloudflare Worker.
+    از قفل استفاده نمی‌کند (فقط خواندن سطحی dictها) تا هرگز بلاک نشود؛
+    dict(...) ایمن‌ترین اسنپ‌شات لحظه‌ای در پایتون است."""
+    try:
+        return {
+            "links": dict(LINKS),
+            "subs": dict(SUBS),
+            "password_hash": AUTH.get("password_hash"),
+            "saved_at": datetime.now().isoformat(),
+            "host": CONFIG.get("host"),
+            "version": "9.5",
+        }
+    except Exception:
+        return {}
+
 @app.on_event("startup")
 async def startup():
     global http_client
@@ -199,6 +290,27 @@ async def startup():
         limits=limits, timeout=timeout, follow_redirects=True,
     )
     await load_state()
+    # 🎯 برای هر کانفیگ قدیمی که هنوز گروه ساب نداره، گروه خودکار بساز
+    try:
+        async with LINKS_LOCK:
+            snap = list(LINKS.items())
+        migrated = 0
+        for uid, link in snap:
+            if not link.get("sub_id"):
+                await _ensure_auto_sub_for_link(uid, link.get("label", "کانفیگ"))
+                migrated += 1
+        if migrated:
+            logger.info(f"🔗 auto-created sub groups for {migrated} legacy links")
+            await save_state()
+    except Exception as e:
+        logger.warning(f"auto-sub migration failed: {e}")
+    # فعال‌سازی همگام‌سازی زنده با Cloudflare Worker
+    try:
+        import cf_sync  # noqa: F401 (اطمینان از لود شدن ماژول حتی اگر جای دیگر ایمپورت نشده باشد)
+        cf_sync.set_snapshot_provider(_cf_snapshot)
+        await cf_sync.start()
+    except Exception as e:
+        logger.warning(f"cf_sync could not start: {e}")
     await _tg_start_bot()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
     logger.info(f"X4G v9.5 started on port {CONFIG['port']}")
@@ -206,6 +318,11 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await save_state()
+    try:
+        import cf_sync
+        await cf_sync.stop()
+    except Exception:
+        pass
     await _tg_stop_bot()
     if http_client:
         await http_client.aclose()
@@ -281,16 +398,140 @@ def generate_vless_link(
     return f"vless://{uuid}@{host}:{port_val}?{query}#{quote(remark)}"
 
 def vless_link_for_link(link: dict, uid: str, host: str) -> str:
-    """generate_vless_link رو با تنظیمات دستی همون کانفیگ (fingerprint/alpn/port) صدا می‌زنه."""
+    """generate_vless_link رو با تنظیمات دستی همون کانفیگ (fingerprint/alpn/port) صدا می‌زنه.
+
+    🇩🇪 اگر «Cloudflare Worker Proxy» برای این کانفیگ فعال باشد و آدرس ورکر ست شده
+    باشد، به‌جای هاست Railway از هاست ورکر استفاده می‌شود تا مشتری به IP آلمانی/
+    اروپایی Cloudflare وصل بشه، پینگ کمتر، IP اصلی مخفی و در ایران بازتر.
+
+    نکته: فقط پروتکل vless-ws با Worker کار می‌کنه؛ برای XHTTP این گزینه نادیده
+    گرفته می‌شه چون Cloudflare Worker از XHTTP پشتیبانی نمی‌کنه.
+    """
     proto = link.get("protocol", DEFAULT_PROTOCOL)
+    effective_host = host
+    if link.get("use_worker") and proto == "vless-ws":
+        wh = (link.get("worker_host") or WORKER_PROXY.get("host") or "").strip()
+        if wh:
+            effective_host = wh
     return generate_vless_link(
-        uid, host,
+        uid, host if proto != "vless-ws" else effective_host,
         remark=f"X4G-{link.get('label','')}",
         protocol=proto,
         fingerprint=link.get("fingerprint"),
         alpn=link.get("alpn"),
         port=link.get("port"),
     )
+
+def _fake_info_config(remark: str) -> str:
+    """
+    یه کانفیگ vless «الکی» که کار نمی‌کنه ولی توی v2rayNG/Streisand به‌عنوان یه
+    ردیف در لیست ظاهر می‌شه — استفاده‌ش برای نشون دادن اطلاعات به کاربر
+    (حجم، انقضا، لوکیشن، پیام ادمین) به‌عنوان اسم آیتم.
+    آدرس 127.0.0.1 استفاده می‌شه که هیچ‌وقت وصل نشه و مصرف نکنه.
+    """
+    fake_uuid = "00000000-0000-0000-0000-000000000000"
+    params = "encryption=none&security=none&type=tcp&headerType=none"
+    return f"vless://{fake_uuid}@127.0.0.1:80?{params}#{quote(remark)}"
+
+def format_days_left(expires_at: str | None) -> str:
+    """چند روز تا انقضا مونده؟"""
+    if not expires_at:
+        return "نامحدود"
+    try:
+        exp = datetime.fromisoformat(expires_at)
+        # اگه tz-aware نیست، به تهران بازش کن
+        if exp.tzinfo is None:
+            delta = exp - datetime.now()
+        else:
+            delta = exp - datetime.now(exp.tzinfo)
+        days = int(delta.total_seconds() / 86400)
+        if days < 0:
+            return "منقضی شده"
+        if days == 0:
+            hrs = int(delta.total_seconds() / 3600)
+            return f"{hrs} ساعت"
+        return f"{days} روز"
+    except Exception:
+        return "-"
+
+def get_country_from_ip(ip: str) -> str:
+    """کشور IP کاربر رو تشخیص می‌ده. سعی می‌کنیم از هدرهای Cloudflare استفاده کنیم."""
+    # این به عنوان fallback؛ کد اصلی از هدر cf-ipcountry استفاده می‌کنه
+    return ""
+
+def build_info_configs(links: list[dict], request: Request | None = None) -> list[str]:
+    """
+    کانفیگ‌های اطلاعاتی که در بالای لیست subscription ظاهر می‌شن:
+      1. 📊 حجم مصرفی / کل حجم
+      2. ⏰ زمان انقضا (روز باقی‌مانده)
+      3. 🎯 لوکیشن اتومات (بر اساس کشور کاربر)
+      4. 📢 پیام ادمین (اگه ست شده باشه)
+
+    این کانفیگ‌ها vless الکی هستن که فقط اسم‌شون مهمه.
+    """
+    infos = []
+    if not links:
+        return infos
+
+    # 1) 📊 حجم
+    total_used = sum(int(l.get("used_bytes", 0)) for l in links)
+    limits = [int(l.get("limit_bytes", 0)) for l in links]
+    if any(lb == 0 for lb in limits):
+        vol_line = f"📊 مصرف: {fmt_bytes(total_used)} / نامحدود"
+    else:
+        total_limit = sum(limits)
+        left = max(0, total_limit - total_used)
+        pct = int((total_used / total_limit * 100)) if total_limit > 0 else 0
+        vol_line = f"📊 مانده: {fmt_bytes(left)} / {fmt_bytes(total_limit)} ({pct}%)"
+    infos.append(_fake_info_config(vol_line))
+
+    # 2) ⏰ انقضا
+    expire_ts = 0
+    for l in links:
+        exp = l.get("expires_at")
+        if not exp:
+            continue
+        try:
+            ts = int(datetime.fromisoformat(exp).timestamp())
+            if expire_ts == 0 or ts < expire_ts:
+                expire_ts = ts
+        except Exception:
+            pass
+    if expire_ts > 0:
+        # از نزدیک‌ترین انقضا
+        try:
+            nearest_exp = min(
+                (l.get("expires_at") for l in links if l.get("expires_at")),
+                default=None
+            )
+            days_str = format_days_left(nearest_exp)
+            infos.append(_fake_info_config(f"⏰ انقضا: {days_str}"))
+        except Exception:
+            pass
+    else:
+        infos.append(_fake_info_config("⏰ انقضا: نامحدود"))
+
+    # 3) 🎯 لوکیشن اتومات
+    country = ""
+    if request is not None:
+        # Cloudflare, Railway، aiogram و بقیه معمولاً این هدر رو می‌فرستن
+        country = (request.headers.get("cf-ipcountry")
+                or request.headers.get("x-country")
+                or request.headers.get("x-vercel-ip-country")
+                or "").upper()
+    if country and country != "XX":
+        infos.append(_fake_info_config(f"🌍 لوکیشن: {country} (اتومات)"))
+    else:
+        infos.append(_fake_info_config("🎯 لوکیشن: انتخاب خودکار"))
+
+    # 4) 📢 پیام ادمین
+    msg = (ADMIN_MSG.get("text") or "").strip()
+    if msg:
+        # فقط ۶۰ کاراکتر اول برای اسم کانفیگ
+        short = msg[:60]
+        infos.append(_fake_info_config(f"📢 {short}"))
+
+    return infos
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
@@ -424,9 +665,18 @@ async def subscription_single(uuid: str, request: Request):
         raise HTTPException(status_code=404, detail="not found or inactive")
     host = get_host(request)
     vless = vless_link_for_link(link, uuid, host)
-    content = base64.b64encode(vless.encode()).decode()
-    return Response(content=content, media_type="text/plain",
-                    headers={"profile-title": quote(link["label"]), "support-url": "https://t.me/Farajian2004f"})
+    # 🎯 کانفیگ‌های اطلاعاتی (حجم، انقضا، لوکیشن، پیام ادمین) در بالای لیست
+    info_lines = build_info_configs([link], request)
+    all_lines = info_lines + [vless]
+    content = base64.b64encode("\n".join(all_lines).encode()).decode()
+    headers = {
+        "profile-title": quote(link["label"]),
+        "support-url": "https://t.me/Farajian2004f",
+        "profile-update-interval": "12",
+        # 📊 حجم و انقضا رو تو کلاینت (v2rayNG، Streisand، Hiddify، ...) نشون می‌ده
+        "subscription-userinfo": build_userinfo_header([link]),
+    }
+    return Response(content=content, media_type="text/plain", headers=headers)
 
 @app.get("/sub-all")
 async def subscription_all(request: Request, _=Depends(require_auth)):
@@ -464,16 +714,26 @@ async def create_sub(request: Request, _=Depends(require_auth)):
         }
     asyncio.create_task(save_state())
     log_activity("sub", f"گروه «{name}» ساخته شد", "ok")
+    try:
+        cf_sync.push_event("SUB_CREATED", {"sub_id": sub_id, "name": name})
+    except Exception:
+        pass
     host = get_host(request)
     return {
         "sub_id": sub_id,
         **SUBS[sub_id],
+        # 🎯 لینک یکپارچه: هم برای مرورگر (صفحه HTML) هم برای کلاینت VPN (subscription)
         "public_url": f"https://{host}/p/{uuid_key}",
-        "sub_url": f"https://{host}/sub-group/{uuid_key}",
+        "sub_url": f"https://{host}/p/{uuid_key}",
+        # نسخه‌ی legacy برای عقب‌رو-سازگاری (اگه جایی مستقیماً به subscription نیاز بود)
+        "sub_url_legacy": f"https://{host}/sub-group/{uuid_key}",
     }
 
 @app.get("/api/subs")
 async def list_subs(request: Request, _=Depends(require_auth)):
+    """گروه‌های ساب که کاربر مستقیم ساخته — گروه‌های خودکارِ تک‌کانفیگ مخفی می‌شن.
+    (چون هر کانفیگ لینک ساب پابلیک خودش رو در کارت کانفیگ داره.)"""
+    include_auto = request.query_params.get("include_auto") == "1"
     host = get_host(request)
     async with SUBS_LOCK:
         snap_subs = dict(SUBS)
@@ -481,6 +741,9 @@ async def list_subs(request: Request, _=Depends(require_auth)):
         snap_links = dict(LINKS)
     result = []
     for sid, s in snap_subs.items():
+        # فقط گروه‌های دستی (نه گروه‌های خودکار تک‌کانفیگ) نمایش داده بشن
+        if s.get("auto_created") and not include_auto:
+            continue
         link_ids = s.get("link_ids", [])
         active_count = sum(1 for lid in link_ids if is_link_allowed(snap_links.get(lid)))
         total_used = sum(snap_links[lid].get("used_bytes", 0) for lid in link_ids if lid in snap_links)
@@ -493,8 +756,10 @@ async def list_subs(request: Request, _=Depends(require_auth)):
             "active_count": active_count,
             "total_used_bytes": total_used,
             "total_used_fmt": fmt_bytes(total_used),
+            # 🎯 لینک یکپارچه (مرورگر → HTML، کلاینت VPN → subscription)
             "public_url": f"https://{host}/p/{s['uuid_key']}",
-            "sub_url": f"https://{host}/sub-group/{s['uuid_key']}",
+            "sub_url": f"https://{host}/p/{s['uuid_key']}",
+            "sub_url_legacy": f"https://{host}/sub-group/{s['uuid_key']}",
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"subs": result}
@@ -516,6 +781,10 @@ async def update_sub(sub_id: str, request: Request, _=Depends(require_auth)):
         if "link_ids" in body:
             s["link_ids"] = list(body["link_ids"])
     asyncio.create_task(save_state())
+    try:
+        cf_sync.push_event("SUB_UPDATED", {"sub_id": sub_id, "changed_fields": list(body.keys())})
+    except Exception:
+        pass
     return {"ok": True}
 
 @app.delete("/api/subs/{sub_id}")
@@ -531,6 +800,10 @@ async def delete_sub(sub_id: str, _=Depends(require_auth)):
                 link["sub_id"] = None
     asyncio.create_task(save_state())
     log_activity("sub", f"گروه «{name}» حذف شد", "warn")
+    try:
+        cf_sync.push_event("SUB_DELETED", {"sub_id": sub_id, "name": name})
+    except Exception:
+        pass
     return {"ok": True, "deleted": sub_id}
 
 @app.post("/api/subs/{sub_id}/links")
@@ -572,13 +845,18 @@ async def sub_group_subscription(uuid_key: str, request: Request):
     host = get_host(request)
     link_ids = sub.get("link_ids", [])
     async with LINKS_LOCK:
+        active_links = []
         lines = []
         for lid in link_ids:
             link = LINKS.get(lid)
             if link and is_link_allowed(link):
+                active_links.append(link)
                 lines.append(vless_link_for_link(link, lid, host))
 
-    content = base64.b64encode("\n".join(lines).encode()).decode()
+    # 🎯 کانفیگ‌های اطلاعاتی در بالای لیست
+    info_lines = build_info_configs(active_links, request)
+    all_lines = info_lines + lines
+    content = base64.b64encode("\n".join(all_lines).encode()).decode()
     return Response(
         content=content,
         media_type="text/plain",
@@ -586,6 +864,8 @@ async def sub_group_subscription(uuid_key: str, request: Request):
             "profile-title": quote(sub["name"]),
             "support-url": "https://t.me/Farajian2004f",
             "profile-update-interval": "12",
+            # 📊 حجم/انقضا داخل کلاینت VPN
+            "subscription-userinfo": build_userinfo_header(active_links),
         }
     )
 
@@ -628,6 +908,10 @@ async def api_change_password(request: Request, token=Depends(require_auth)):
         SESSIONS[token] = time.time() + SESSION_TTL
     await save_state()
     log_activity("auth", "رمز عبور پنل تغییر کرد", "ok")
+    try:
+        cf_sync.push_event("SETTINGS_UPDATED", {"change": "admin_password"})
+    except Exception:
+        pass
     return {"ok": True}
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
@@ -654,6 +938,98 @@ async def get_stats(_=Depends(require_auth)):
 @app.get("/api/activity")
 async def get_activity(_=Depends(require_auth)):
     return {"logs": list(activity_logs)[-150:]}
+
+# ── 🇩🇪 Cloudflare Worker Proxy (VLESS-WS via Cloudflare) ────────────────────
+@app.get("/api/worker-proxy")
+async def get_worker_proxy(_=Depends(require_auth)):
+    """وضعیت فعلی Worker Proxy."""
+    async with LINKS_LOCK:
+        total = sum(1 for l in LINKS.values() if l.get("protocol") == "vless-ws")
+        active = sum(1 for l in LINKS.values() if l.get("use_worker") and l.get("protocol") == "vless-ws")
+    return {
+        "host": WORKER_PROXY.get("host", ""),
+        "enabled_default": bool(WORKER_PROXY.get("enabled_default", False)),
+        "eligible_links": total,   # کل کانفیگ‌های vless-ws
+        "using_worker": active,    # چند تاشون الان از worker استفاده می‌کنن
+    }
+
+@app.post("/api/worker-proxy")
+async def set_worker_proxy(request: Request, _=Depends(require_auth)):
+    """آدرس Worker و پیش‌فرض رو ست می‌کنه."""
+    body = await request.json()
+    if "host" in body:
+        # حذف http:// و https:// و / انتهایی
+        h = str(body["host"]).strip()
+        for pref in ("https://", "http://"):
+            if h.lower().startswith(pref):
+                h = h[len(pref):]
+        h = h.rstrip("/").split("/")[0]  # فقط بخش host
+        WORKER_PROXY["host"] = h[:150]
+    if "enabled_default" in body:
+        WORKER_PROXY["enabled_default"] = bool(body["enabled_default"])
+    await save_state()
+    log_activity("system", f"Worker Proxy تنظیم شد: host={WORKER_PROXY['host'] or '—'}, default={'روشن' if WORKER_PROXY['enabled_default'] else 'خاموش'}", "info")
+    try:
+        cf_sync.push_event("SETTINGS_UPDATED", {"change": "worker_proxy", **WORKER_PROXY})
+    except Exception:
+        pass
+    return {"ok": True, **WORKER_PROXY}
+
+@app.post("/api/worker-proxy/apply-all")
+async def apply_worker_to_all(request: Request, _=Depends(require_auth)):
+    """
+    عملیات دسته‌جمعی: use_worker رو روی همه‌ی کانفیگ‌های vless-ws روشن/خاموش می‌کنه.
+    Body: {"enable": true|false}
+    """
+    body = await request.json()
+    enable = bool(body.get("enable", True))
+    changed = 0
+    async with LINKS_LOCK:
+        for uid, l in LINKS.items():
+            if l.get("protocol") == "vless-ws":
+                if bool(l.get("use_worker")) != enable:
+                    l["use_worker"] = enable
+                    changed += 1
+    if changed:
+        await save_state()
+        log_activity("system", f"Worker Proxy روی {changed} کانفیگ {'فعال' if enable else 'غیرفعال'} شد", "info")
+    return {"ok": True, "changed": changed, "enabled": enable}
+
+# ── 📢 Admin Message (broadcast to all subscribers via subscription) ────────
+@app.get("/api/admin-message")
+async def get_admin_message(_=Depends(require_auth)):
+    return {
+        "text": ADMIN_MSG.get("text", ""),
+        "updated_at": ADMIN_MSG.get("updated_at"),
+    }
+
+@app.post("/api/admin-message")
+async def set_admin_message(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    text = str(body.get("text", "")).strip()[:200]
+    ADMIN_MSG["text"] = text
+    ADMIN_MSG["updated_at"] = datetime.now().isoformat()
+    await save_state()
+    log_activity("system", f"پیام ادمین به‌روزرسانی شد: «{text[:40]}»", "info")
+    try:
+        cf_sync.push_event("SETTINGS_UPDATED", {"change": "admin_message", "text": text})
+    except Exception:
+        pass
+    return {"ok": True, "text": text}
+
+# ── Cloudflare Live Sync — وضعیت و اجرای دستی ────────────────────────────────
+@app.get("/api/cf-sync/status")
+async def cf_sync_status(_=Depends(require_auth)):
+    """گزارش وضعیت ماژول همگام‌سازی زنده با Cloudflare Worker."""
+    return cf_sync.get_stats()
+
+@app.post("/api/cf-sync/push")
+async def cf_sync_push_now(_=Depends(require_auth)):
+    """اجبار به ارسال یک بکاپ کامل همین الان (Manual Push)."""
+    if not cf_sync.enabled():
+        raise HTTPException(status_code=400, detail="cf_sync غیرفعال است (CF_WORKER_URL/CF_SYNC_SECRET تنظیم نشده).")
+    cf_sync.push_event("MANUAL_FULL_BACKUP", {"triggered_by": "admin"})
+    return {"ok": True}
 
 # ── Live connections (with IP) ────────────────────────────────────────────────
 @app.get("/api/connections")
@@ -718,6 +1094,49 @@ async def get_connections(_=Depends(require_auth)):
     }
 
 # ── Shared link create/delete helpers (استفاده مشترک API و ربات تلگرام) ───────
+async def _ensure_auto_sub_for_link(uid: str, label: str) -> str | None:
+    """
+    برای هر کانفیگ به‌طور خودکار یه گروه ساب می‌سازه (اگه نداشته باشه) که لینک
+    یکپارچه‌ی `/p/{uuid_key}` براش وجود داشته باشه.
+
+    این باعث می‌شه ادمین بدون نیاز به دست‌کاری «گروه‌های ساب»، مستقیم از کارت
+    کانفیگ لینک پابلیک/ساب رو کپی کنه و به مشتری بده. مشتری در کلاینت v2ray
+    حجم و انقضا رو خودکار می‌بینه.
+
+    اگه کانفیگ قبلاً به یه گروهی متصل بود، همون رو نگه می‌داره.
+    """
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if link is None:
+            return None
+        existing_sub = link.get("sub_id")
+    if existing_sub:
+        async with SUBS_LOCK:
+            if existing_sub in SUBS:
+                return existing_sub
+        # sub_id قدیمی معتبر نیست → پاکش می‌کنیم و از نو می‌سازیم
+        async with LINKS_LOCK:
+            if uid in LINKS:
+                LINKS[uid]["sub_id"] = None
+
+    # ساخت گروه خودکار
+    sub_id = generate_uuid()
+    uuid_key = secrets.token_urlsafe(16)
+    async with SUBS_LOCK:
+        SUBS[sub_id] = {
+            "name": (label or "کانفیگ")[:60],
+            "desc": "",
+            "password_hash": None,
+            "uuid_key": uuid_key,
+            "created_at": datetime.now().isoformat(),
+            "link_ids": [uid],
+            "auto_created": True,   # نشانه‌ی گروه خودکار — در UI مخفی می‌مونه
+        }
+    async with LINKS_LOCK:
+        if uid in LINKS:
+            LINKS[uid]["sub_id"] = sub_id
+    return sub_id
+
 async def make_link(
     label: str = "لینک جدید",
     limit_bytes: int = 0,
@@ -730,6 +1149,7 @@ async def make_link(
     port: int = DEFAULT_PORT,
     ip_limit: int = 0,
     speed_limit_bytes: int = 0,
+    use_worker: bool | None = None,
 ) -> tuple[str, dict]:
     if protocol not in PROTOCOLS:
         protocol = DEFAULT_PROTOCOL
@@ -738,6 +1158,10 @@ async def make_link(
         fingerprint = DEFAULT_FINGERPRINT
     if not (MIN_PORT <= port <= MAX_PORT):
         port = DEFAULT_PORT
+    # 🇩🇪 Worker Proxy فقط برای vless-ws معنی داره؛ اگر بی‌مقدار بود از پیش‌فرض بخون
+    if use_worker is None:
+        use_worker = bool(WORKER_PROXY.get("enabled_default"))
+    use_worker = bool(use_worker) and protocol == "vless-ws"
     uid = generate_uuid()
     async with LINKS_LOCK:
         LINKS[uid] = {
@@ -756,6 +1180,7 @@ async def make_link(
             "port": port,
             "ip_limit": max(0, ip_limit),
             "speed_limit_bytes": max(0, speed_limit_bytes),
+            "use_worker": use_worker,
         }
     if sub_id:
         async with SUBS_LOCK:
@@ -763,8 +1188,22 @@ async def make_link(
                 ids = SUBS[sub_id].setdefault("link_ids", [])
                 if uid not in ids:
                     ids.append(uid)
+    else:
+        # 🎯 گروه ساب خودکار برای این کانفیگ (تا لینک یکپارچه /p/... داشته باشه)
+        sub_id = await _ensure_auto_sub_for_link(uid, LINKS[uid]["label"])
     asyncio.create_task(save_state())
     log_activity("link", f"کانفیگ «{LINKS[uid]['label']}» ساخته شد", "ok")
+    try:
+        cf_sync.push_event("USER_CREATED", {
+            "uuid": uid,
+            "label": LINKS[uid].get("label"),
+            "limit_bytes": LINKS[uid].get("limit_bytes"),
+            "expires_at": LINKS[uid].get("expires_at"),
+            "protocol": LINKS[uid].get("protocol"),
+            "sub_id": sub_id,
+        })
+    except Exception:
+        pass
     return uid, LINKS[uid]
 
 async def remove_link(uid: str) -> str | None:
@@ -780,8 +1219,15 @@ async def remove_link(uid: str) -> str | None:
                 ids = SUBS[sub_id].get("link_ids", [])
                 if uid in ids:
                     ids.remove(uid)
+                # اگه گروه خودکار بود و کانفیگی توش نمونده، خودش حذف بشه
+                if SUBS[sub_id].get("auto_created") and not SUBS[sub_id].get("link_ids"):
+                    del SUBS[sub_id]
     asyncio.create_task(save_state())
     log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
+    try:
+        cf_sync.push_event("USER_DELETED", {"uuid": uid, "label": label, "sub_id": sub_id})
+    except Exception:
+        pass
     return label
 
 async def set_link_active(uid: str, active: bool) -> dict | None:
@@ -792,6 +1238,12 @@ async def set_link_active(uid: str, active: bool) -> dict | None:
         label = LINKS[uid]["label"]
     log_activity("link", f"کانفیگ «{label}» {'فعال' if active else 'غیرفعال'} شد", "ok" if active else "warn")
     asyncio.create_task(save_state())
+    try:
+        cf_sync.push_event("USER_UPDATED", {
+            "uuid": uid, "label": label, "active": bool(active), "change": "active_toggle",
+        })
+    except Exception:
+        pass
     return LINKS[uid]
 
 # ── Sub-group helpers (reusable — هم API وب هم ربات تلگرام از همین‌ها استفاده می‌کنن) ──
@@ -812,6 +1264,10 @@ async def create_sub_group(name: str = "گروه جدید", desc: str = "", pass
         }
     asyncio.create_task(save_state())
     log_activity("sub", f"گروه «{name}» ساخته شد", "ok")
+    try:
+        cf_sync.push_event("SUB_CREATED", {"sub_id": sub_id, "name": name})
+    except Exception:
+        pass
     return sub_id, SUBS[sub_id]
 
 async def set_link_sub(uid: str, sub_id: str | None) -> bool:
@@ -839,6 +1295,12 @@ async def set_link_sub(uid: str, sub_id: str | None) -> bool:
             LINKS[uid]["sub_id"] = sub_id
     asyncio.create_task(save_state())
     log_activity("link", f"کانفیگ «{label}» {'به گروه اضافه شد' if sub_id else 'از گروه خارج شد'}", "info")
+    try:
+        cf_sync.push_event("USER_UPDATED", {
+            "uuid": uid, "label": label, "sub_id": sub_id, "change": "sub_assignment",
+        })
+    except Exception:
+        pass
     return True
 
 async def remove_sub_group(sub_id: str) -> str | None:
@@ -853,6 +1315,10 @@ async def remove_sub_group(sub_id: str) -> str | None:
                 link["sub_id"] = None
     asyncio.create_task(save_state())
     log_activity("sub", f"گروه «{name}» حذف شد", "warn")
+    try:
+        cf_sync.push_event("SUB_DELETED", {"sub_id": sub_id, "name": name})
+    except Exception:
+        pass
     return name
 
 # ── Link Management ───────────────────────────────────────────────────────────
@@ -877,6 +1343,9 @@ async def create_link(request: Request, _=Depends(require_auth)):
     su = body.get("speed_limit_unit") or "MBIT"
     speed_limit_bytes = 0 if sv <= 0 else parse_speed_to_bytes(sv, su)
 
+    # 🇩🇪 اگر بدنه صراحتاً use_worker داشت، همون؛ وگرنه از پیش‌فرض پنل
+    uw = body.get("use_worker")
+    use_worker = bool(uw) if uw is not None else None
     uid, link = await make_link(
         label=body.get("label") or "لینک جدید",
         limit_bytes=limit_bytes,
@@ -889,15 +1358,24 @@ async def create_link(request: Request, _=Depends(require_auth)):
         port=port,
         ip_limit=ip_limit,
         speed_limit_bytes=speed_limit_bytes,
+        use_worker=use_worker,
     )
 
     host = get_host(request)
+    # 🎯 لینک یکپارچه (پابلیک + ساب): از گروه ساب خودکار این کانفیگ
+    smart_url = f"https://{host}/sub/{uid}"
+    sid = link.get("sub_id")
+    if sid:
+        async with SUBS_LOCK:
+            if sid in SUBS and SUBS[sid].get("uuid_key"):
+                smart_url = f"https://{host}/p/{SUBS[sid]['uuid_key']}"
     return {
         "uuid": uid,
         **link,
         "expired": False,
         "vless_link": vless_link_for_link(link, uid, host),
-        "sub_url": f"https://{host}/sub/{uid}",
+        "sub_url": smart_url,               # ⭐ لینک یکپارچه (این رو مشتری می‌بره)
+        "single_sub_url": f"https://{host}/sub/{uid}",  # لینک ساده تک‌کانفیگ (بک‌آپ)
     }
 
 @app.get("/api/links")
@@ -905,16 +1383,24 @@ async def list_links(request: Request, _=Depends(require_auth)):
     host = get_host(request)
     async with LINKS_LOCK:
         snap = dict(LINKS)
+    async with SUBS_LOCK:
+        subs_snap = dict(SUBS)
     result = []
     for uid, d in snap.items():
         proto = d.get("protocol", DEFAULT_PROTOCOL)
+        # 🎯 لینک یکپارچه (پابلیک + ساب) از گروه ساب خودکار
+        smart_url = f"https://{host}/sub/{uid}"
+        sid = d.get("sub_id")
+        if sid and sid in subs_snap and subs_snap[sid].get("uuid_key"):
+            smart_url = f"https://{host}/p/{subs_snap[sid]['uuid_key']}"
         result.append({
             "uuid": uid,
             **d,
             "protocol": proto,
             "expired": is_link_expired(d),
             "vless_link": vless_link_for_link(d, uid, host),
-            "sub_url": f"https://{host}/sub/{uid}",
+            "sub_url": smart_url,                             # ⭐ لینک یکپارچه
+            "single_sub_url": f"https://{host}/sub/{uid}",    # لینک ساده تک
             "connected_ips": len(unique_ips_for_uuid(uid)),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
@@ -934,6 +1420,17 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
             log_activity("link", f"کانفیگ «{label}» {'فعال' if link['active'] else 'غیرفعال'} شد", "ok" if link["active"] else "warn")
         if "label" in body:
             link["label"] = str(body["label"])[:60]
+            # اگه گروه ساب خودکار داره، اسم گروه هم آپدیت بشه
+            _sid = link.get("sub_id")
+            if _sid:
+                # (بدون async lock چون همین لحظه توی SUBS_LOCK جدا می‌ره؛
+                #  ولی از اونجایی که مقدار ساده‌ای رو ست می‌کنیم و خطرناک نیست
+                #  از تلاش ساده استفاده می‌کنیم)
+                try:
+                    if _sid in SUBS and SUBS[_sid].get("auto_created"):
+                        SUBS[_sid]["name"] = link["label"]
+                except Exception:
+                    pass
         if "note" in body:
             link["note"] = str(body["note"])[:200]
         if "reset_usage" in body and body["reset_usage"]:
@@ -969,7 +1466,10 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
             link["speed_limit_bytes"] = 0 if sv <= 0 else parse_speed_to_bytes(sv, su)
             from speed_limit import reset_bucket
             reset_bucket(uid)
-        if any(k in body for k in ("label", "note", "limit_value", "expires_days", "fingerprint", "alpn", "port", "ip_limit", "speed_limit_value")):
+        if "use_worker" in body:
+            # 🇩🇪 توجه: فقط برای پروتکل vless-ws معنی داره
+            link["use_worker"] = bool(body["use_worker"]) and link.get("protocol") == "vless-ws"
+        if any(k in body for k in ("label", "note", "limit_value", "expires_days", "fingerprint", "alpn", "port", "ip_limit", "speed_limit_value", "use_worker")):
             log_activity("link", f"کانفیگ «{link['label']}» ویرایش شد", "info")
         new_sub = body.get("sub_id", "UNCHANGED")
         if new_sub != "UNCHANGED":
@@ -987,6 +1487,20 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
                     ids.append(uid)
 
     asyncio.create_task(save_state())
+    try:
+        _l = LINKS.get(uid, {})
+        cf_sync.push_event("USER_UPDATED", {
+            "uuid": uid,
+            "label": _l.get("label"),
+            "limit_bytes": _l.get("limit_bytes"),
+            "used_bytes": _l.get("used_bytes"),
+            "expires_at": _l.get("expires_at"),
+            "active": _l.get("active"),
+            "sub_id": _l.get("sub_id"),
+            "changed_fields": list(body.keys()),
+        })
+    except Exception:
+        pass
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
@@ -1008,6 +1522,8 @@ from relay_vless import (
     relay_tcp_to_ws,
     websocket_tunnel,
 )
+
+
 
 app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
 
@@ -1044,15 +1560,66 @@ async def http_proxy(target_url: str, request: Request):
         error_logs.append({"error": str(exc), "url": target_url, "time": datetime.now().isoformat()})
         raise HTTPException(status_code=502, detail=f"Proxy error: {exc}")
 
-# ── Public sub page ───────────────────────────────────────────────────────────
-@app.get("/p/{uuid_key}", response_class=HTMLResponse)
+# ── Public sub page (smart: browser → HTML page, VPN client → subscription) ─
+@app.get("/p/{uuid_key}")
 async def public_sub_page(uuid_key: str, request: Request):
+    """
+    🔥 لینک یکپارچه (Unified Sub Link)
+    یک آدرس واحد برای مشتری — و بر اساس اینکه با چی بازش می‌کنه، خروجی مناسب می‌ده:
+
+      • اگه با v2rayNG/Streisand/Hiddify/... باز کنه (کلاینت VPN):
+          → محتوای subscription (base64 کانفیگ‌ها) با هدر subscription-userinfo
+             تا حجم مصرفی، کل حجم و تاریخ انقضا داخل کلاینت نمایش داده بشه.
+
+      • اگه با مرورگر (Chrome/Safari/...) باز کنه:
+          → صفحه‌ی HTML زیبا با QR کد، مشخصات، دکمه‌ی کپی و ...
+    """
     from pages import get_public_page_html
+    import base64
+
     async with SUBS_LOCK:
-        sub = next(({"sub_id": sid, **s} for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
-    if not sub:
+        sub_entry = next(((sid, s) for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
+    if not sub_entry:
+        # اگه کلاینت VPN بود، خطای متنی؛ وگرنه صفحه HTML
+        if is_vpn_client(request):
+            return Response("not found", status_code=404, media_type="text/plain")
         return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px'>گروه پیدا نشد</h2>", status_code=404)
-    return HTMLResponse(content=get_public_page_html(uuid_key))
+    sub_id, sub = sub_entry
+
+    # 🌐 مرورگر → صفحه HTML قشنگ (همون قبلی، دست‌نخورده)
+    if not is_vpn_client(request):
+        return HTMLResponse(content=get_public_page_html(uuid_key))
+
+    # 📱 کلاینت VPN → subscription content
+    # اگه گروه رمز داره، رمز باید تو query باشه (?pw=...)
+    if sub.get("password_hash"):
+        pw = request.query_params.get("pw", "")
+        if hash_password(pw) != sub["password_hash"]:
+            return Response("wrong password", status_code=403, media_type="text/plain")
+
+    host = get_host(request)
+    link_ids = sub.get("link_ids", [])
+    async with LINKS_LOCK:
+        active_links = []
+        lines = []
+        for lid in link_ids:
+            link = LINKS.get(lid)
+            if link and is_link_allowed(link):
+                active_links.append(link)
+                lines.append(vless_link_for_link(link, lid, host))
+
+    # 🎯 کانفیگ‌های اطلاعاتی (حجم، انقضا، لوکیشن، پیام ادمین) در بالای لیست
+    info_lines = build_info_configs(active_links, request)
+    all_lines = info_lines + lines
+    content = base64.b64encode("\n".join(all_lines).encode()).decode()
+    headers = {
+        "profile-title": quote(sub["name"]),
+        "support-url": "https://t.me/Farajian2004f",
+        "profile-update-interval": "12",
+        # 📊 مهم: این هدر باعث می‌شه v2rayNG/Streisand/Hiddify حجم و انقضا رو نشون بدن
+        "subscription-userinfo": build_userinfo_header(active_links),
+    }
+    return Response(content=content, media_type="text/plain", headers=headers)
 
 @app.get("/api/public/sub/{uuid_key}")
 async def public_sub_data(uuid_key: str, request: Request):
@@ -1105,7 +1672,9 @@ async def public_sub_data(uuid_key: str, request: Request):
         "locked": False,
         "name": sub["name"],
         "desc": sub.get("desc", ""),
-        "sub_url": f"https://{host}/sub-group/{uuid_key}",
+        # 🎯 لینک یکپارچه که مشتری می‌گیره
+        "sub_url": f"https://{host}/p/{uuid_key}",
+        "sub_url_legacy": f"https://{host}/sub-group/{uuid_key}",
         "active_connections": active_conns,
         "total_used_fmt": fmt_bytes(total_used),
         "links": links_out,
@@ -1132,4 +1701,19 @@ async def test_ws_redirect():
     return HTMLResponse(content="<script>location.href='/dashboard'</script>")
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1)
+    # ⚡ تنظیمات uvicorn برای کاهش پینگ و پایداری بیشتر:
+    #   - ws_ping_interval=20 → هر 20 ثانیه ping WS برای زنده نگه‌داشتن اتصال
+    #   - ws_ping_timeout=20  → اگه 20 ثانیه pong نیومد، اتصال مرده حساب شه
+    #   - timeout_keep_alive=15 → HTTP keep-alive برای XHTTP سریع‌تر
+    #   - h11_max_incomplete_event_size بزرگ‌تر برای هدرهای بزرگ v2ray
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=CONFIG["port"],
+        log_level="info",
+        workers=1,
+        ws_ping_interval=20,
+        ws_ping_timeout=20,
+        timeout_keep_alive=15,
+        h11_max_incomplete_event_size=64 * 1024,
+    )

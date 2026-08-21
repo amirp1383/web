@@ -776,7 +776,17 @@ a{color:inherit;text-decoration:none}
           <option value="randomized">randomized</option>
         </select>
       </div>
-      <div class="fg" style="flex:1"><label>ALPN (خالی = پیش‌فرض)</label><input class="fi" id="el-alpn" placeholder="مثلاً: h2,http/1.1" style="width:100%"></div>
+      <div class="fg" style="flex:1"><label>ALPN (خالی = پیش‌فرض)</label>
+        <input class="fi" id="el-alpn" placeholder="مثلاً: h2,http/1.1" style="width:100%">
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value='h3,h2,http/1.1'">🌟 همه</button>
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value='h2,http/1.1'">h2,http/1.1</button>
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value='h2'">h2</button>
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value='h3'">h3</button>
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value='http/1.1'">http/1.1</button>
+          <button type="button" class="btn" style="padding:4px 10px;font-size:12px" onclick="document.getElementById('el-alpn').value=''">پیش‌فرض</button>
+        </div>
+      </div>
     </div>
     <div class="form-row" style="margin-bottom:16px">
       <div class="fg" style="flex:1"><label>پورت اتصال</label><input class="fi" id="el-port" type="number" min="1" max="65535" style="width:100%"></div>
@@ -814,7 +824,6 @@ a{color:inherit;text-decoration:none}
     <div class="nav-sec">پنل</div>
     <div class="nav-it on" data-pg="overview"><i class="ti ti-layout-dashboard"></i> داشبورد</div>
     <div class="nav-it" data-pg="links"><i class="ti ti-link-plus"></i> کانفیگ‌ها <span class="nav-badge" id="links-nb">0</span></div>
-    <div class="nav-it" data-pg="subgroups"><i class="ti ti-folders"></i> گروه‌های ساب <span class="nav-badge" id="subs-nb">0</span></div>
     <div class="nav-it" data-pg="subscriptions"><i class="ti ti-rss"></i> سابسکریپشن</div>
     <div class="nav-it" data-pg="traffic"><i class="ti ti-chart-area"></i> ترافیک</div>
     <div class="nav-it" data-pg="connections"><i class="ti ti-plug-connected"></i> اتصالات <span class="nav-badge" id="conns-nb">0</span></div>
@@ -858,7 +867,6 @@ a{color:inherit;text-decoration:none}
       <button class="btn btn-p" onclick="cpText('vless-main')"><i class="ti ti-copy"></i> کپی</button>
       <button class="btn btn-g" onclick="qrFor('vless-main')"><i class="ti ti-qrcode"></i> QR</button>
       <button class="btn btn-o" onclick="navTo('links')"><i class="ti ti-link-plus"></i> کانفیگ محدود</button>
-      <button class="btn btn-pur" onclick="navTo('subgroups')"><i class="ti ti-folders"></i> گروه‌های ساب</button>
     </div>
   </div>
   <div class="g3">
@@ -884,6 +892,42 @@ a{color:inherit;text-decoration:none}
       <div id="lsummary">—</div>
     </div>
   </div>
+  <!-- 🇩🇪 Cloudflare Worker Proxy -->
+  <div class="card" style="margin-top:14px;border-right:3px solid #F59E0B">
+    <div class="card-title"><i class="ti ti-world-www" style="color:#F59E0B"></i> Cloudflare Worker Proxy <span class="badge bg-amber" style="margin-right:8px">🇩🇪 IP اروپایی</span></div>
+    <div style="color:var(--t2);font-size:12px;margin-bottom:10px">
+      کانفیگ‌های <b>vless-ws</b> رو از طریق Cloudflare Worker سرو کن تا مشتری IP اروپایی بگیره، پینگ کمتر شه و IP اصلی سرور مخفی بمونه.
+      فقط برای <b>vless-ws</b> کار می‌کنه (نه XHTTP).
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">
+      <div style="flex:1;min-width:240px">
+        <label style="display:block;font-size:11px;color:var(--t2);margin-bottom:4px">آدرس Worker</label>
+        <input id="wp-host" placeholder="مثلاً: sub-proxy.jjgadradan.workers.dev" style="width:100%;padding:9px 12px;border:1px solid var(--card-b);background:var(--bg2);color:var(--t1);border-radius:8px;font-family:ui-monospace,monospace;font-size:12px;outline:none">
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--t2);padding:9px 0">
+        <input type="checkbox" id="wp-default" style="width:16px;height:16px;cursor:pointer">
+        <span>کانفیگ‌های جدید پیش‌فرض روشن باشن</span>
+      </label>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center">
+      <button class="btn btn-sm btn-amber" onclick="saveWorkerProxy()"><i class="ti ti-device-floppy"></i> ذخیره تنظیمات</button>
+      <button class="btn btn-sm btn-g" onclick="applyWorkerAll(true)"><i class="ti ti-check"></i> روشن روی همه‌ی vless-ws</button>
+      <button class="btn btn-sm btn-o" onclick="applyWorkerAll(false)"><i class="ti ti-x"></i> خاموش روی همه</button>
+      <span style="color:var(--t2);font-size:11px;margin-right:auto" id="wp-status">—</span>
+    </div>
+  </div>
+
+  <!-- 📢 پیام ادمین (Broadcast to all subscribers) -->
+  <div class="card" style="margin-top:14px;border-right:3px solid #A78BFA">
+    <div class="card-title"><i class="ti ti-speakerphone" style="color:#A78BFA"></i> پیام ادمین به مشتری‌ها <span class="badge bg-purple" style="margin-right:8px">Broadcast</span></div>
+    <div style="color:var(--t2);font-size:12px;margin-bottom:10px">این پیام به‌عنوان یه ردیف اطلاعاتی داخل v2rayNG/Streisand/Hiddify همه‌ی مشتری‌ها ظاهر می‌شه (حداکثر ۲۰۰ کاراکتر).</div>
+    <textarea id="admin-msg-input" placeholder="مثلاً: به‌روزرسانی سرور فردا ساعت ۲ بامداد · بدون قطعی" maxlength="200" style="width:100%;min-height:60px;padding:10px 12px;border:1px solid var(--card-b);background:var(--bg2);color:var(--t1);border-radius:8px;font-family:inherit;font-size:13px;resize:vertical;outline:none"></textarea>
+    <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-sm btn-pur" onclick="saveAdminMsg()"><i class="ti ti-send"></i> ارسال به همه‌ی مشتریان</button>
+      <button class="btn btn-sm btn-o" onclick="clearAdminMsg()"><i class="ti ti-eraser"></i> پاک کردن پیام</button>
+      <span style="color:var(--t2);font-size:11px;margin-right:auto" id="admin-msg-info">—</span>
+    </div>
+  </div>
   <div class="dash-footer">
     <span class="df-text">X4G v9.5 · Railway</span>
     <a class="df-link" href="https://t.me/Farajian2004f" target="_blank"><i class="ti ti-brand-telegram"></i> t.me/Farajian2004f</a>
@@ -904,41 +948,43 @@ a{color:inherit;text-decoration:none}
       </div>
     </div>
     <div class="cp-body">
+      <div class="cp-block mb16">
+        <div class="cp-block-label"><i class="ti ti-id-badge-2"></i> شناسه کانفیگ</div>
+        <input class="cp-input-full" id="nl-label" placeholder="مثلاً: کاربر علی">
+        <div class="cp-mini-row">
+          <input class="cp-input-full" id="nl-note" placeholder="یادداشت (اختیاری)">
+        </div>
+        <!-- select گروه مخفیه چون گروه خودکار ساخته می‌شه ولی JS ازش استفاده می‌کنه -->
+        <select id="nl-sub" style="display:none"><option value="" selected>— خودکار —</option></select>
+      </div>
       <div class="cp-row">
         <div class="cp-block">
-          <div class="cp-block-label"><i class="ti ti-id-badge-2"></i> شناسه کانفیگ</div>
-          <input class="cp-input-full" id="nl-label" placeholder="مثلاً: کاربر علی">
-          <div class="cp-mini-row">
-            <input class="cp-input-full" id="nl-note" placeholder="یادداشت (اختیاری)">
+          <div class="cp-block-label"><i class="ti ti-gauge"></i> سهمیه ترافیک</div>
+          <div class="cp-quota-inputs">
+            <input class="cp-input-full" id="nl-val" type="number" min="0" step="0.1" placeholder="0 = نامحدود">
+            <select class="cp-input-full fs" id="nl-unit"><option value="GB">GB</option><option value="MB" selected>MB</option></select>
+          </div>
+          <div class="chip-row" id="quota-chips">
+            <span class="chip" onclick="setQuota(0,'GB',this)">نامحدود</span>
+            <span class="chip" onclick="setQuota(500,'MB',this)">۵۰۰ MB</span>
+            <span class="chip active" onclick="setQuota(1,'GB',this)">۱ GB</span>
+            <span class="chip" onclick="setQuota(5,'GB',this)">۵ GB</span>
+            <span class="chip" onclick="setQuota(10,'GB',this)">۱۰ GB</span>
+            <span class="chip" onclick="setQuota(50,'GB',this)">۵۰ GB</span>
           </div>
         </div>
         <div class="cp-block">
-          <div class="cp-block-label"><i class="ti ti-folders"></i> گروه ساب و انقضا</div>
-          <select class="cp-input-full fs" id="nl-sub"><option value="">— بدون گروه —</option></select>
-          <div class="cp-mini-row">
-            <input class="cp-input-full" id="nl-exp" type="number" min="0" step="1" placeholder="انقضا (روز) · 0 = نامحدود">
-          </div>
+          <div class="cp-block-label"><i class="ti ti-calendar-time"></i> زمان انقضا</div>
+          <input class="cp-input-full" id="nl-exp" type="number" min="0" step="1" placeholder="روز · 0 = نامحدود">
           <div class="chip-row" id="exp-chips">
             <span class="chip" onclick="setExpiry(0,this)">نامحدود</span>
             <span class="chip" onclick="setExpiry(7,this)">۷ روز</span>
             <span class="chip active" onclick="setExpiry(30,this)">۳۰ روز</span>
+            <span class="chip" onclick="setExpiry(60,this)">۶۰ روز</span>
             <span class="chip" onclick="setExpiry(90,this)">۹۰ روز</span>
+            <span class="chip" onclick="setExpiry(180,this)">۶ ماه</span>
+            <span class="chip" onclick="setExpiry(365,this)">۱ سال</span>
           </div>
-        </div>
-      </div>
-      <div class="cp-block mb16">
-        <div class="cp-block-label"><i class="ti ti-gauge"></i> سهمیه ترافیک</div>
-        <div class="cp-quota-inputs">
-          <input class="cp-input-full" id="nl-val" type="number" min="0" step="0.1" placeholder="0 = نامحدود">
-          <select class="cp-input-full fs" id="nl-unit"><option value="GB">GB</option><option value="MB" selected>MB</option></select>
-        </div>
-        <div class="chip-row" id="quota-chips">
-          <span class="chip" onclick="setQuota(0,'GB',this)">نامحدود</span>
-          <span class="chip" onclick="setQuota(500,'MB',this)">۵۰۰ MB</span>
-          <span class="chip active" onclick="setQuota(1,'GB',this)">۱ GB</span>
-          <span class="chip" onclick="setQuota(5,'GB',this)">۵ GB</span>
-          <span class="chip" onclick="setQuota(10,'GB',this)">۱۰ GB</span>
-          <span class="chip" onclick="setQuota(50,'GB',this)">۵۰ GB</span>
         </div>
       </div>
       <div class="cp-block mb16">
@@ -989,9 +1035,11 @@ a{color:inherit;text-decoration:none}
           <div class="cp-block-label"><i class="ti ti-antenna-bars-5"></i> ALPN</div>
           <select class="cp-input-full fs" id="nl-alpn-preset" onchange="onAlpnPresetChange()">
             <option value="">پیش‌فرض پروتکل</option>
+            <option value="h3,h2,http/1.1">🌟 همه (h3,h2,http/1.1)</option>
             <option value="h2,http/1.1">h2,http/1.1</option>
             <option value="http/1.1">http/1.1</option>
             <option value="h2">h2</option>
+            <option value="h3">h3</option>
             <option value="__custom__">دستی...</option>
           </select>
           <div class="cp-mini-row">
@@ -1490,14 +1538,16 @@ async function loadLinks(){
         <span class="cfg-sub-tag" title="Fingerprint"><i class="ti ti-fingerprint"></i> ${esc(l.fingerprint||'chrome')}</span>
         <span class="cfg-sub-tag" title="آی‌پی‌های متصل / محدودیت"><i class="ti ti-users"></i> ${l.connected_ips||0}${l.ip_limit?('/'+l.ip_limit):' (∞)'}</span>
         <span class="cfg-sub-tag" title="محدودیت سرعت"><i class="ti ti-gauge"></i> ${l.speed_limit_bytes?((l.speed_limit_bytes*8/1024/1024).toFixed(1)+' Mbps'):'نامحدود'}</span>
+        ${l.protocol==='vless-ws'&&l.use_worker?`<span class="cfg-sub-tag" style="background:rgba(245,158,11,0.15);color:#F59E0B" title="از Cloudflare Worker استفاده می‌کنه (IP اروپایی)">🇩🇪 Worker</span>`:''}
         ${l.sub_id&&allSubsList.find(s=>s.sub_id===l.sub_id)?`<span class="cfg-sub-tag"><i class="ti ti-folder"></i> ${esc(allSubsList.find(s=>s.sub_id===l.sub_id).name)}</span>`:''}
       </div>
       <div class="cfg-divider-v"></div>
       <div class="cfg-actions">
         <button class="tog${allowed?' on':''}" onclick="toggleActive('${l.uuid}',${!l.active})" title="فعال/غیرفعال"></button>
-        <button class="btn btn-sm btn-g btn-icon" onclick="navigator.clipboard.writeText('${esc(l.vless_link)}').then(()=>toast('لینک کپی شد','ok'))" title="کپی لینک"><i class="ti ti-copy"></i></button>
-        <button class="btn btn-sm btn-g btn-icon" onclick="navigator.clipboard.writeText('${esc(l.sub_url)}').then(()=>toast('Sub کپی شد','ok'))" title="Sub URL"><i class="ti ti-rss"></i></button>
-        <button class="btn btn-sm btn-g btn-icon" onclick="showQR('${esc(l.vless_link)}')" title="QR"><i class="ti ti-qrcode"></i></button>
+        <button class="btn btn-sm btn-pur btn-icon" onclick="navigator.clipboard.writeText('${esc(l.sub_url)}').then(()=>toast('🎯 لینک ساب کپی شد — به مشتری بده!','ok'))" title="⭐ لینک ساب مشتری (پابلیک + حجم + انقضا)" style="box-shadow:0 0 0 2px rgba(139,92,246,0.35)"><i class="ti ti-share-3"></i></button>
+        <button class="btn btn-sm btn-g btn-icon" onclick="navigator.clipboard.writeText('${esc(l.vless_link)}').then(()=>toast('لینک vless کپی شد','ok'))" title="کپی لینک vless مستقیم"><i class="ti ti-copy"></i></button>
+        <button class="btn btn-sm btn-g btn-icon" onclick="showQR('${esc(l.sub_url)}')" title="QR لینک ساب مشتری"><i class="ti ti-qrcode"></i></button>
+        ${l.protocol==='vless-ws'?`<button class="btn btn-sm ${l.use_worker?'btn-amber':'btn-g'} btn-icon" onclick="toggleWorker('${l.uuid}',${!l.use_worker})" title="${l.use_worker?'🇩🇪 از طریق Worker (کلیک: خاموش)':'🏢 مستقیم از Railway (کلیک: روشن Worker)'}">🇩🇪</button>`:''}
         <button class="btn btn-sm btn-amber btn-icon" onclick="openEditLink('${l.uuid}')" title="ویرایش"><i class="ti ti-edit"></i></button>
         <button class="btn btn-sm btn-g btn-icon" onclick="resetUsage('${l.uuid}')" title="ریست مصرف"><i class="ti ti-rotate"></i></button>
         <button class="btn btn-sm btn-d btn-icon" onclick="deleteLink('${l.uuid}')" title="حذف"><i class="ti ti-trash"></i></button>
@@ -1590,8 +1640,8 @@ async function loadSubs(){
     const r=await authF('/api/subs'),d=await r.json();
     const subs=d.subs||[];
     allSubsRaw=subs;
-    document.getElementById('subs-nb').textContent=subs.length;
-    document.getElementById('subs-pg-cnt').textContent=toFa(subs.length)+' گروه';
+    const _nb=document.getElementById('subs-nb'); if(_nb) _nb.textContent=subs.length;
+    const _pc=document.getElementById('subs-pg-cnt'); if(_pc) _pc.textContent=toFa(subs.length)+' گروه';
     renderSubsGrid(subs);
   }catch(e){console.error(e)}
 }
@@ -1826,7 +1876,71 @@ async function fetchDefaultVless(){
 }
 function cpText(id){navigator.clipboard.writeText(document.getElementById(id).textContent).then(()=>toast('کپی شد ✓','ok'))}
 function qrFor(id){showQR(document.getElementById(id).textContent)}
-function refreshAll(){fetchStats();fetchDefaultVless();loadLinks();if(document.getElementById('pg-subgroups').classList.contains('on'))loadSubs();if(document.getElementById('pg-subscriptions').classList.contains('on'))loadSubsPage();if(document.getElementById('pg-connections').classList.contains('on'))loadConns();if(document.getElementById('pg-logs').classList.contains('on'))loadActivity();toast('رفرش شد','ok')}
+function refreshAll(){fetchStats();fetchDefaultVless();loadLinks();loadAdminMsg();loadWorkerProxy();if(document.getElementById('pg-subgroups').classList.contains('on'))loadSubs();if(document.getElementById('pg-subscriptions').classList.contains('on'))loadSubsPage();if(document.getElementById('pg-connections').classList.contains('on'))loadConns();if(document.getElementById('pg-logs').classList.contains('on'))loadActivity();toast('رفرش شد','ok')}
+
+// ── سوییچ Worker برای یک کانفیگ ───────────────────────────
+async function toggleWorker(uid, enable){
+  try{
+    const r=await authF('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({use_worker:enable})});
+    if(r&&r.ok){ toast(enable?'🇩🇪 Worker روشن شد':'🏢 Worker خاموش شد','ok'); loadLinks(); loadWorkerProxy(); }
+    else toast('خطا','err');
+  }catch(e){ toast('خطا','err'); }
+}
+
+// ── 🇩🇪 Cloudflare Worker Proxy ───────────────────────────
+async function loadWorkerProxy(){
+  try{
+    const r=await authF('/api/worker-proxy'); if(!r||!r.ok) return;
+    const d=await r.json();
+    const hi=document.getElementById('wp-host'); if(hi) hi.value=d.host||'';
+    const di=document.getElementById('wp-default'); if(di) di.checked=!!d.enabled_default;
+    const st=document.getElementById('wp-status');
+    if(st) st.textContent = `کانفیگ‌های vless-ws: ${d.eligible_links||0} · فعال روی worker: ${d.using_worker||0}`;
+  }catch(e){}
+}
+async function saveWorkerProxy(){
+  const host=document.getElementById('wp-host').value.trim();
+  const enabled_default=document.getElementById('wp-default').checked;
+  try{
+    const r=await authF('/api/worker-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host,enabled_default})});
+    if(r&&r.ok){ toast('✅ تنظیمات Worker ذخیره شد','ok'); loadWorkerProxy(); loadLinks(); }
+    else toast('خطا','err');
+  }catch(e){ toast('خطا','err'); }
+}
+async function applyWorkerAll(enable){
+  if(!confirm(enable ? '🇩🇪 آیا Worker Proxy رو روی همه‌ی کانفیگ‌های vless-ws فعال کنم؟' : '❌ آیا Worker Proxy رو از همه‌ی کانفیگ‌ها خاموش کنم؟')) return;
+  try{
+    const r=await authF('/api/worker-proxy/apply-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enable})});
+    const d=await r.json();
+    toast(`✅ ${d.changed} کانفیگ ${enable?'روشن':'خاموش'} شد`,'ok');
+    loadWorkerProxy(); loadLinks();
+  }catch(e){ toast('خطا','err'); }
+}
+
+// ── 📢 Admin Message ─────────────────────────────────────
+async function loadAdminMsg(){
+  try{
+    const r=await authF('/api/admin-message'); if(!r||!r.ok) return;
+    const d=await r.json();
+    const inp=document.getElementById('admin-msg-input'); if(!inp) return;
+    inp.value=d.text||'';
+    const info=document.getElementById('admin-msg-info');
+    if(info) info.textContent = d.updated_at ? ('آخرین بروزرسانی: '+new Date(d.updated_at).toLocaleString('fa-IR')) : 'پیامی ثبت نشده';
+  }catch(e){}
+}
+async function saveAdminMsg(){
+  const inp=document.getElementById('admin-msg-input'); if(!inp) return;
+  const text=inp.value.trim();
+  try{
+    const r=await authF('/api/admin-message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+    if(r&&r.ok){ toast(text?'📢 پیام برای همه‌ی مشتری‌ها ارسال شد':'پیام پاک شد','ok'); loadAdminMsg(); }
+    else toast('خطا در ارسال پیام','err');
+  }catch(e){ toast('خطا در ارسال پیام','err'); }
+}
+async function clearAdminMsg(){
+  const inp=document.getElementById('admin-msg-input'); if(inp) inp.value='';
+  await saveAdminMsg();
+}
 async function changePw(){
   const cur=document.getElementById('cp-cur').value,nw=document.getElementById('cp-new').value,cf=document.getElementById('cp-cf').value;
   if(!cur||!nw||!cf){toast('همه فیلدها را پر کنید','err');return}
@@ -1949,7 +2063,7 @@ document.addEventListener('DOMContentLoaded',async()=>{
   initCharts();
   document.getElementById('set-host').textContent=location.host;
   document.getElementById('sub-all-url')&&(document.getElementById('sub-all-url').textContent=location.protocol+'//'+location.host+'/sub-all');
-  fetchStats();fetchDefaultVless();loadLinks();loadSubs();
+  fetchStats();fetchDefaultVless();loadLinks();loadSubs();loadAdminMsg();loadWorkerProxy();
   setInterval(fetchStats,4000);
   setInterval(()=>{
     if(document.getElementById('pg-links').classList.contains('on'))loadLinks();

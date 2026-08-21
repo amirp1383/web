@@ -94,6 +94,103 @@
 | `TELEGRAM_BOT_TOKEN` | توکن ربات تلگرام (اختیاری) | — |
 | `TELEGRAM_ADMIN_IDS` | آیدی عددی ادمین‌های مجاز ربات، جدا با کاما (اختیاری) | — |
 | `RAILWAY_PUBLIC_DOMAIN` | دامنه عمومی سرویس؛ به‌صورت خودکار توسط Railway تنظیم می‌شود | `localhost` |
+| `CF_WORKER_URL` | آدرس Cloudflare Worker برای بکاپ/گزارش‌دهی زنده (مثلاً `https://sub-proxy.you.workers.dev/api/push-backup`). خالی = ماژول غیرفعال | — |
+| `CF_SYNC_SECRET` | پسورد امنیتی که در هدر `X-Sync-Secret` هر درخواست ارسال می‌شود؛ Worker باید همین را چک کند | — |
+| `CF_SYNC_INTERVAL` | بازه‌ی cron بکاپ کامل به ثانیه | `900` |
+| `CF_SYNC_TIMEOUT` | تایم‌اوت هر درخواست به ثانیه | `15` |
+| `CF_SYNC_RETRIES` | تعداد retry در صورت خطا | `3` |
+| `CF_SYNC_DISABLED` | با مقدار `1`/`true` ماژول کاملاً غیرفعال می‌شود | — |
+
+## 🔄 Live Storage Sync & Reporting (Cloudflare Worker)
+
+پنل یک ماژول گزارش‌دهی/بکاپ لحظه‌ای دارد که هر عملیات ذخیره‌سازی را بلافاصله به یک **Cloudflare Worker** POST می‌کند و علاوه بر آن هر ۱۵ دقیقه یک بکاپ کامل هم می‌فرستد.
+
+> 🧒 **آموزش خیلی ساده مرحله‌به‌مرحله (به زبان بچگانه):** [`docs/آموزش-ساده.md`](docs/%D8%A2%D9%85%D9%88%D8%B2%D8%B4-%D8%B3%D8%A7%D8%AF%D9%87.md)
+> شامل: راه‌اندازی Cloudflare Worker، KV، رمز جادویی، متغیرهای Railway، رفع خطاهای رایج (`Name or service not known`، `unauthorized`، `HTTP 403`)، و راهنمای برگردوندن بکاپ روی پنل جدید Railway.
+
+### فعال‌سازی
+
+فقط این دو متغیر محیطی را تنظیم کنید:
+
+```
+CF_WORKER_URL   = https://sub-proxy.you.workers.dev/api/push-backup
+CF_SYNC_SECRET  = یک-پسورد-تصادفی-قوی
+```
+
+### قرارداد درخواست
+
+- روش: `POST`
+- هدرها:
+    - `Content-Type: application/json`
+    - `X-Sync-Secret: <همان CF_SYNC_SECRET>` ← **Worker باید این را اعتبارسنجی کند**
+    - `X-Sync-Event: <event_type>` (کپی از بدنه، برای مسیریابی سریع)
+    - `User-Agent: X4G-LiveSync/1.0`
+- بدنه (JSON):
+
+```jsonc
+{
+  "event_type": "USER_CREATED",     // یا USER_UPDATED / USER_DELETED / SUB_CREATED / SUB_UPDATED / SUB_DELETED / SETTINGS_UPDATED / CRON_AUTO_SYNC / MANUAL_FULL_BACKUP
+  "timestamp": "2026-08-20T19:00:00.000000",
+  "timestamp_unix": 1755720000,
+  "details": {                       // اطلاعات موجودیت تغییریافته
+    "uuid": "…", "label": "…", "limit_bytes": 0, "expires_at": null, "sub_id": null
+  },
+  "total_users": 42,                 // تعداد کاربران (کانفیگ‌های) فعال
+  "full_backup": {                   // اسنپ‌شات کامل دیتابیس
+    "links": { "<uuid>": { … } },
+    "subs":  { "<sub_id>": { … } },
+    "password_hash": "…",
+    "saved_at": "…",
+    "host": "…",
+    "version": "9.5"
+  }
+}
+```
+
+### رویدادها
+
+| `event_type` | زمان ارسال |
+|---|---|
+| `USER_CREATED` | ساخت کانفیگ جدید |
+| `USER_UPDATED` | ویرایش، تمدید حجم/زمان، فعال/غیرفعال، تخصیص به گروه |
+| `USER_DELETED` | حذف کانفیگ |
+| `SUB_CREATED` / `SUB_UPDATED` / `SUB_DELETED` | تغییرات گروه‌های ساب |
+| `SETTINGS_UPDATED` | تغییر تنظیمات پنل (مثل رمز ادمین) |
+| `CRON_AUTO_SYNC` | هر `CF_SYNC_INTERVAL` ثانیه (پیش‌فرض ۱۵ دقیقه) |
+| `MANUAL_FULL_BACKUP` | با فراخوانی `POST /api/cf-sync/push` از پنل |
+
+### Endpointهای مدیریتی
+
+- `GET  /api/cf-sync/status` — وضعیت ماژول (تعداد موفق/ناموفق، آخرین خطا، …)
+- `POST /api/cf-sync/push`   — اجبار به ارسال یک بکاپ کامل همین لحظه
+
+### نمونه Worker (Cloudflare)
+
+```js
+export default {
+  async fetch(req, env) {
+    if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+    if (req.headers.get("X-Sync-Secret") !== env.CF_SYNC_SECRET)
+      return new Response("Forbidden", { status: 403 });
+
+    const payload = await req.json();
+    // ذخیره در KV با کلیدهای timeline و آخرین snapshot
+    await env.BACKUPS.put("latest.json", JSON.stringify(payload));
+    await env.BACKUPS.put(
+      `events/${payload.timestamp_unix}-${payload.event_type}.json`,
+      JSON.stringify(payload),
+      { expirationTtl: 60 * 60 * 24 * 30 }, // ۳۰ روز
+    );
+    return Response.json({ ok: true, received: payload.event_type });
+  },
+};
+```
+
+### نکات امنیتی
+
+- `CF_SYNC_SECRET` را **بلند و تصادفی** انتخاب کنید (مثل `openssl rand -hex 32`) و آن را در Cloudflare Worker به‌عنوان Secret Variable ذخیره کنید.
+- ارسال به‌صورت **non-blocking** انجام می‌شود؛ حتی اگر Worker پاسخ ندهد یا کند باشد، هیچ تأخیری در پنل ایجاد نمی‌شود.
+- ماژول به‌صورت خودکار retry می‌کند (پیش‌فرض ۳ بار با backoff نمایی).
 
 ## ⚠️ نکته مهم
 
